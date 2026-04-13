@@ -1,6 +1,8 @@
 """GEO Performance — Profound data analysis."""
 
+import os
 import re
+from datetime import date
 from urllib.parse import urlparse
 
 import pandas as pd
@@ -11,8 +13,11 @@ import streamlit as st
 from config import (
     COMPETITOR_DOMAINS,
     COMPETITOR_NAMES,
+    DATA_DIR,
     OWNED_DOMAINS,
     TOPIC_COMPETITORS,
+    categorize_page,
+    find_profound_csvs,
 )
 from llm import render_llm_insights
 
@@ -53,6 +58,25 @@ def _has_domain(row, domain_set: set, cit_cols: list[str]) -> bool:
     return False
 
 
+def _extract_owned_urls(df: pd.DataFrame, cit_cols: list[str]) -> pd.Series:
+    """Extract all owned-domain URLs from citation columns. Returns a Series of URLs."""
+    urls = []
+    for c in cit_cols:
+        for v in df[c].dropna():
+            if not isinstance(v, str) or not v.startswith("http"):
+                continue
+            try:
+                h = urlparse(v).netloc.lower().removeprefix("www.")
+                if any(h == d or h.endswith("." + d) for d in OWNED_DOMAINS):
+                    # Normalize: strip query params and trailing slash
+                    parsed = urlparse(v)
+                    clean = f"{parsed.scheme}://{parsed.netloc}{parsed.path.rstrip('/')}"
+                    urls.append(clean)
+            except Exception:
+                pass
+    return pd.Series(urls) if urls else pd.Series(dtype=str)
+
+
 def _comp_mentioned(mentions_str: str) -> bool:
     """Check if any competitor name appears in the mentions column."""
     m = str(mentions_str).lower()
@@ -75,8 +99,22 @@ def _extract_comp_names(mentions_series: pd.Series) -> pd.Series:
 # Render
 # ---------------------------------------------------------------------------
 
+def _save_upload(uploaded_file) -> str:
+    """Save uploaded Profound CSV to data/ and return the path."""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    name = f"profound_{date.today().isoformat()}_{uploaded_file.name}"
+    path = os.path.join(DATA_DIR, name)
+    uploaded_file.seek(0)
+    with open(path, "wb") as f:
+        f.write(uploaded_file.read())
+    uploaded_file.seek(0)
+    return path
+
+
 def render():
     st.header("GEO Performance — Profound Data")
+
+    saved = find_profound_csvs()
 
     uploaded = st.file_uploader(
         "Upload Profound CSV (raw data with citations)",
@@ -84,11 +122,16 @@ def render():
         key="profound_upload",
     )
 
-    if uploaded is None:
+    if uploaded is not None:
+        save_path = _save_upload(uploaded)
+        st.caption(f"Saved to `{save_path}`")
+        df = _load_profound_data(uploaded)
+    elif saved:
+        st.caption(f"Loaded from `{saved[-1]}`")
+        df = _load_profound_data(saved[-1])
+    else:
         st.info("Upload a Profound CSV export to see GEO analysis.")
         return
-
-    df = _load_profound_data(uploaded)
 
     # Pre-compute derived columns once
     cit_cols = _citation_columns(df)
@@ -137,10 +180,15 @@ def render():
     mentioned = filtered[filtered["is_mentioned"]]
     prompts_appeared = mentioned["prompt"].nunique()
 
-    m1, m2, m3 = st.columns(3)
+    # Count unique owned articles cited
+    owned_urls = _extract_owned_urls(filtered, cit_cols)
+    unique_articles_cited = owned_urls.nunique() if not owned_urls.empty else 0
+
+    m1, m2, m3, m4 = st.columns(4)
     m1.metric("Total Unique Prompts", total_prompts)
     m2.metric("Prompts We're Mentioned In", prompts_appeared)
     m3.metric("Mention Rate", f"{prompts_appeared / total_prompts * 100:.0f}%")
+    m4.metric("Our Articles Cited", unique_articles_cited)
 
     # --- Per-platform appearance ---
     st.subheader("Mentions by Platform")
@@ -212,6 +260,51 @@ def render():
         color_continuous_scale="Blues",
     )
     st.plotly_chart(fig_heatmap, use_container_width=True)
+
+    # --- Our Articles Cited ---
+    st.subheader("Our Articles Cited")
+
+    if owned_urls.empty:
+        st.info("No owned-domain URLs found in citations.")
+    else:
+        url_counts = owned_urls.value_counts().reset_index()
+        url_counts.columns = ["URL", "Times Cited"]
+
+        # Extract path for readability
+        url_counts["Page"] = url_counts["URL"].apply(
+            lambda u: urlparse(u).path.rstrip("/") or "/"
+        )
+        url_counts["Page Category"] = url_counts["Page"].apply(
+            lambda p: categorize_page(p)
+        )
+
+        col_chart, col_table = st.columns([2, 1])
+        with col_chart:
+            fig_cited = px.bar(
+                url_counts.head(15),
+                x="Times Cited",
+                y="Page",
+                orientation="h",
+                title="Most Cited Owned Pages (Top 15)",
+            )
+            fig_cited.update_layout(yaxis={"categoryorder": "total ascending"})
+            st.plotly_chart(fig_cited, use_container_width=True)
+
+        with col_table:
+            st.dataframe(
+                url_counts[["Page", "Page Category", "Times Cited"]],
+                hide_index=True,
+                use_container_width=True,
+            )
+
+        # Summary by page category
+        cat_cited = url_counts.groupby("Page Category").agg(
+            unique_pages=("Page", "nunique"),
+            total_citations=("Times Cited", "sum"),
+        ).reset_index().sort_values("total_citations", ascending=False)
+        cat_cited.columns = ["Page Category", "Unique Pages", "Total Citations"]
+        st.write("**Citations by page category:**")
+        st.dataframe(cat_cited, hide_index=True, use_container_width=True)
 
     # --- Position distribution ---
     st.subheader("Position Distribution")
@@ -522,9 +615,11 @@ def render():
             f", biggest gaps: {', '.join(gap_prompts['prompt'].head(3).tolist())}"
         )
 
+    articles_summary = f"\nOwned articles cited: {unique_articles_cited}"
+
     data_summary = f"""Topic: {selected_topic}
 Total prompts: {total_prompts}, Mentioned in: {prompts_appeared} ({prompts_appeared/total_prompts*100:.0f}%)
 Per platform: {', '.join(f"{s['Platform']}: {s['Mentioned']}/{s['Total Prompts']}" for s in platform_stats)}
-Cross-platform: All 3: {all_three}, At least 2: {at_least_two}, Only 1: {exactly_one}{comp_summary}{gap_summary}"""
+Cross-platform: All 3: {all_three}, At least 2: {at_least_two}, Only 1: {exactly_one}{articles_summary}{comp_summary}{gap_summary}"""
 
     render_llm_insights("GEO Performance", data_summary)

@@ -9,7 +9,10 @@ The CSV has a 5-line metadata header, then columns:
     <domain>_difference, Search Volume, CPC, Keyword Difficulty
 """
 
+import io
+import os
 import re
+from datetime import date
 from urllib.parse import urlparse
 
 import numpy as np
@@ -18,7 +21,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-from config import categorize_page
+from config import DATA_DIR, categorize_page, find_keyword_csvs
 from llm import render_llm_insights
 
 # Maps raw intent codes to human-readable labels.
@@ -154,8 +157,23 @@ def _expand_intents(intent_str: str) -> list[str]:
 # Render
 # ---------------------------------------------------------------------------
 
+def _save_upload(uploaded_file) -> str:
+    """Save uploaded keyword CSV to data/ and return the path."""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    name = f"keywords_{date.today().isoformat()}_{uploaded_file.name}"
+    path = os.path.join(DATA_DIR, name)
+    uploaded_file.seek(0)
+    with open(path, "wb") as f:
+        f.write(uploaded_file.read())
+    uploaded_file.seek(0)
+    return path
+
+
 def render():
     st.header("Keyword Performance")
+
+    # Load from disk if available
+    saved = find_keyword_csvs()
 
     uploaded = st.file_uploader(
         "Upload SEMrush Position Tracking CSV",
@@ -164,11 +182,18 @@ def render():
         help="SEMrush → Position Tracking → Rankings Overview → Export CSV",
     )
 
-    if uploaded is None:
+    if uploaded is not None:
+        save_path = _save_upload(uploaded)
+        st.caption(f"Saved to `{save_path}`")
+        keywords_df, daily_df = _parse_position_tracking_csv(uploaded)
+    elif saved:
+        st.caption(f"Loaded from `{saved[-1]}`")
+        with open(saved[-1], "rb") as f:
+            keywords_df, daily_df = _parse_position_tracking_csv(io.BytesIO(f.read()))
+    else:
         st.info("Upload a SEMrush Position Tracking CSV to see analysis.")
         return
 
-    keywords_df, daily_df = _parse_position_tracking_csv(uploaded)
     if daily_df.empty:
         return
 
