@@ -22,15 +22,7 @@ def _get_client() -> OpenAI | None:
 
 
 def get_section_summary(section_name: str, data_summary: str) -> str | None:
-    """Generate an LLM insight summary for a dashboard section.
-
-    Args:
-        section_name: e.g. "Search Impressions", "GEO Performance"
-        data_summary: A text representation of the key metrics/data for this section.
-
-    Returns:
-        The LLM-generated insight string, or None if the API key isn't configured.
-    """
+    """Generate an LLM insight summary for a dashboard section."""
     client = _get_client()
     if client is None:
         return None
@@ -43,12 +35,12 @@ def get_section_summary(section_name: str, data_summary: str) -> str | None:
                 "role": "user",
                 "content": f"""You are a marketing analytics expert reviewing weekly metrics for a B2B SaaS company (Maxim AI / Bifrost).
 
-Analyze the following {section_name} data and provide:
-1. Key takeaways (2-3 bullet points)
-2. Notable trends or anomalies
-3. One actionable recommendation
+Analyze the following {section_name} data. Focus on:
+- What changed and why it matters (don't just restate the numbers — interpret them)
+- Any anomalies or surprising movements worth investigating
+- One specific action to take this week
 
-Be concise and specific. Reference actual numbers from the data.
+Be concise — 3-5 bullet points max. Write for a marketing team that already sees the tables.
 
 Data:
 {data_summary}""",
@@ -101,17 +93,24 @@ Data:
     return response.choices[0].message.content
 
 
-def render_llm_insights(section_name: str, data_summary: str):
-    """Render LLM insights in a Streamlit expander."""
-    with st.expander("AI Insights", expanded=False):
-        if _get_client() is None:
-            st.info("Set `OPENAI_API_KEY` in `.env` to enable AI-powered insights.")
-            return
+def render_chart_insight(chart_id: str, data_summary: str, question: str = ""):
+    """Render a small insight button next to a chart.
 
-        if st.button(f"Generate insights", key=f"llm_{section_name}"):
-            with st.spinner("Analyzing..."):
-                summary = get_section_summary(section_name, data_summary)
-                if summary:
-                    st.markdown(summary)
-                else:
-                    st.warning("Failed to generate insights.")
+    Args:
+        chart_id: Unique key for this chart (e.g. "gsc_trend", "geo_trend").
+        data_summary: Text representation of the data shown in the chart.
+        question: Optional specific question to focus the analysis on.
+    """
+    if _get_client() is None:
+        return
+
+    cache_key = f"chart_insight_{chart_id}"
+
+    if st.button("Explain this", key=f"btn_{chart_id}", type="tertiary"):
+        with st.spinner("Analyzing..."):
+            prompt = question or "What's the key takeaway from this data?"
+            result = get_section_summary(prompt, data_summary)
+            st.session_state[cache_key] = result
+
+    if cache_key in st.session_state and st.session_state[cache_key]:
+        st.info(st.session_state[cache_key])

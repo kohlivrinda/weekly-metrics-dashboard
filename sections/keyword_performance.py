@@ -9,10 +9,7 @@ The CSV has a 5-line metadata header, then columns:
     <domain>_difference, Search Volume, CPC, Keyword Difficulty
 """
 
-import io
-import os
 import re
-from datetime import date
 from urllib.parse import urlparse
 
 import numpy as np
@@ -21,8 +18,9 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-from config import DATA_DIR, categorize_page, find_keyword_csvs
-from llm import render_llm_insights
+from config import categorize_page
+from db import query_df, upsert_keywords
+from llm import render_chart_insight
 
 # Maps raw intent codes to human-readable labels.
 INTENT_LABELS = {
@@ -126,6 +124,131 @@ def _parse_position_tracking_csv(uploaded_file) -> tuple[pd.DataFrame, pd.DataFr
     return keywords_df, daily_df
 
 
+def _parse_date_from_col_name(col: str) -> pd.Timestamp | None:
+    """Parse a human-readable date column like '7th Aug Semrush' or 'Aug 16 GSC'.
+
+    Returns a Timestamp or None if unparseable.
+    """
+    # Strip source suffix
+    date_part = re.sub(r"\s*(Semrush|GSC)\s*$", "", col, flags=re.IGNORECASE).strip()
+    # Remove ordinal suffixes
+    date_part = re.sub(r"(\d+)(st|nd|rd|th)\b", r"\1", date_part)
+
+    # Try various formats
+    for fmt in ("%d %b", "%b %d", "%d %B", "%B %d"):
+        try:
+            dt = pd.to_datetime(date_part, format=fmt)
+            # Infer year: if month > current month, it's probably last year
+            # Columns go Aug -> Mar, so Aug-Dec = 2025, Jan-Mar = 2026
+            if dt.month >= 8:
+                dt = dt.replace(year=2025)
+            else:
+                dt = dt.replace(year=2026)
+            return dt
+        except (ValueError, TypeError):
+            continue
+    return None
+
+
+def _parse_keyword_tracking_csv(uploaded_file) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Parse the manually maintained keyword tracking CSV.
+
+    Columns: Primary Keywords, Primary/Secondary, Difficulty, Search Volume,
+    then date-stamped rank columns like '7th Aug Semrush', 'Aug 16 GSC'.
+
+    Returns:
+        keywords_df: One row per keyword with static metadata.
+        daily_df: Long-format dataframe with one row per keyword × date × source.
+    """
+    uploaded_file.seek(0)
+    df = pd.read_csv(uploaded_file)
+    df.columns = [c.strip() for c in df.columns]
+
+    # Identify the keyword column
+    kw_col = None
+    for candidate in ["Primary Keywords", "Keywords", "Keyword"]:
+        if candidate in df.columns:
+            kw_col = candidate
+            break
+    if kw_col is None:
+        st.error("Could not find a keyword column in the CSV.")
+        return pd.DataFrame(), pd.DataFrame()
+
+    # Identify date columns (contain 'Semrush' or 'GSC')
+    date_cols = [c for c in df.columns if re.search(r"(Semrush|GSC)\s*$", c, re.IGNORECASE)]
+    if not date_cols:
+        st.error("Could not find date-stamped rank columns (expected 'Semrush' or 'GSC' suffix).")
+        return pd.DataFrame(), pd.DataFrame()
+
+    # Build long-format daily data
+    daily_rows = []
+    for _, row in df.iterrows():
+        kw = str(row[kw_col]).strip()
+        if not kw:
+            continue
+        for col in date_cols:
+            dt = _parse_date_from_col_name(col)
+            if dt is None:
+                continue
+            source = "semrush" if "semrush" in col.lower() else "gsc"
+            rank_raw = row.get(col, "-")
+            rank = pd.to_numeric(rank_raw, errors="coerce")
+
+            daily_rows.append({
+                "keyword": kw,
+                "date": dt,
+                "rank": rank,
+                "result_type": source,
+                "landing_page": "",
+            })
+
+    daily_df = pd.DataFrame(daily_rows)
+
+    # Build keyword metadata
+    keywords_df = df[[kw_col]].copy()
+    keywords_df = keywords_df.rename(columns={kw_col: "keyword"})
+    keywords_df["keyword"] = keywords_df["keyword"].str.strip()
+
+    if "Primary/Secondary" in df.columns:
+        keywords_df["tags"] = df["Primary/Secondary"].fillna("")
+    else:
+        keywords_df["tags"] = ""
+
+    keywords_df["intents"] = ""
+
+    if "Search Volume" in df.columns:
+        keywords_df["search_volume"] = pd.to_numeric(df["Search Volume"], errors="coerce")
+    if "Difficulty" in df.columns:
+        keywords_df["difficulty"] = pd.to_numeric(df["Difficulty"], errors="coerce")
+
+    keywords_df["cpc"] = np.nan
+
+    return keywords_df, daily_df
+
+
+def _detect_and_parse_csv(uploaded_file) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Auto-detect CSV format and parse accordingly."""
+    uploaded_file.seek(0)
+    header_bytes = uploaded_file.read(2048).decode("utf-8", errors="replace")
+    uploaded_file.seek(0)
+
+    # SEMrush Position Tracking: has a metadata header starting with "---"
+    # and columns with _YYYYMMDD patterns
+    if "Keyword," in header_bytes and re.search(r"_\d{8}", header_bytes):
+        return _parse_position_tracking_csv(uploaded_file)
+
+    # Manual keyword tracking: has 'Semrush' or 'GSC' in column names
+    if re.search(r"(Semrush|GSC)", header_bytes):
+        return _parse_keyword_tracking_csv(uploaded_file)
+
+    st.error(
+        "Unrecognized CSV format. Expected either:\n"
+        "- SEMrush Position Tracking export (columns with `_YYYYMMDD` dates)\n"
+        "- Keyword tracking sheet (columns ending in 'Semrush' or 'GSC')"
+    )
+    return pd.DataFrame(), pd.DataFrame()
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -157,23 +280,71 @@ def _expand_intents(intent_str: str) -> list[str]:
 # Render
 # ---------------------------------------------------------------------------
 
-def _save_upload(uploaded_file) -> str:
-    """Save uploaded keyword CSV to data/ and return the path."""
-    os.makedirs(DATA_DIR, exist_ok=True)
-    name = f"keywords_{date.today().isoformat()}_{uploaded_file.name}"
-    path = os.path.join(DATA_DIR, name)
-    uploaded_file.seek(0)
-    with open(path, "wb") as f:
-        f.write(uploaded_file.read())
-    uploaded_file.seek(0)
-    return path
+def _load_keyword_data() -> tuple[pd.DataFrame, pd.DataFrame] | None:
+    """Load keyword data from database."""
+    daily_df = query_df(
+        "SELECT keyword, date, rank, result_type, landing_page FROM keyword_rankings ORDER BY date"
+    )
+    if daily_df.empty:
+        return None
+    daily_df["date"] = pd.to_datetime(daily_df["date"])
+    daily_df["rank"] = pd.to_numeric(daily_df["rank"], errors="coerce")
+
+    keywords_df = query_df("""
+        SELECT DISTINCT ON (keyword)
+            keyword, search_volume, cpc, difficulty, tags, intents
+        FROM keyword_rankings
+        ORDER BY keyword, date DESC
+    """)
+
+    # Compute wow_change from data
+    dates = sorted(daily_df["date"].unique())
+    if len(dates) >= 2:
+        latest_date = dates[-1]
+        prev_date = latest_date - pd.Timedelta(days=7)
+        closest_prev = daily_df[daily_df["date"] <= prev_date]["date"].max()
+        if pd.notna(closest_prev):
+            latest_ranks = daily_df[daily_df["date"] == latest_date][["keyword", "rank"]].rename(columns={"rank": "rank_latest"})
+            prev_ranks = daily_df[daily_df["date"] == closest_prev][["keyword", "rank"]].rename(columns={"rank": "rank_prev"})
+            wow = latest_ranks.merge(prev_ranks, on="keyword", how="left")
+            wow["wow_change"] = wow["rank_latest"] - wow["rank_prev"]
+            keywords_df = keywords_df.merge(wow[["keyword", "wow_change"]], on="keyword", how="left")
+
+    if "wow_change" not in keywords_df.columns:
+        keywords_df["wow_change"] = np.nan
+
+    return keywords_df, daily_df
+
+
+def _insert_keyword_upload(uploaded_file):
+    """Parse a SEMrush CSV and insert into database."""
+    keywords_df, daily_df = _detect_and_parse_csv(uploaded_file)
+    if daily_df.empty:
+        return 0
+
+    # Merge metadata into daily rows for upsert
+    merged = daily_df.merge(
+        keywords_df[["keyword", "search_volume", "cpc", "difficulty", "tags", "intents"]].drop_duplicates("keyword"),
+        on="keyword",
+        how="left",
+    )
+    merged["date"] = merged["date"].dt.strftime("%Y-%m-%d")
+    merged = merged.fillna({"tags": "", "intents": "", "result_type": "", "landing_page": ""})
+
+    # Convert to records and replace NaN with None (psycopg needs None, not nan)
+    rows = merged.to_dict("records")
+    for row in rows:
+        for key in ("rank", "search_volume", "cpc", "difficulty"):
+            v = row.get(key)
+            if v is not None and (isinstance(v, float) and np.isnan(v)):
+                row[key] = None
+
+    upsert_keywords(rows)
+    return len(rows)
 
 
 def render():
     st.header("Keyword Performance")
-
-    # Load from disk if available
-    saved = find_keyword_csvs()
 
     uploaded = st.file_uploader(
         "Upload SEMrush Position Tracking CSV",
@@ -183,19 +354,34 @@ def render():
     )
 
     if uploaded is not None:
-        save_path = _save_upload(uploaded)
-        st.caption(f"Saved to `{save_path}`")
-        keywords_df, daily_df = _parse_position_tracking_csv(uploaded)
-    elif saved:
-        st.caption(f"Loaded from `{saved[-1]}`")
-        with open(saved[-1], "rb") as f:
-            keywords_df, daily_df = _parse_position_tracking_csv(io.BytesIO(f.read()))
-    else:
-        st.info("Upload a SEMrush Position Tracking CSV to see analysis.")
+        count = _insert_keyword_upload(uploaded)
+        if count:
+            st.success(f"Inserted {count:,} keyword ranking rows.")
+
+    result = _load_keyword_data()
+    if result is None:
+        if uploaded is None:
+            st.info("Upload a SEMrush Position Tracking CSV to see analysis.")
         return
+
+    keywords_df, daily_df = result
 
     if daily_df.empty:
         return
+
+    # --- Date range filter ---
+    all_dates = sorted(daily_df["date"].dt.date.unique())
+    date_range = st.date_input(
+        "Date range",
+        value=(min(all_dates), max(all_dates)),
+        min_value=min(all_dates),
+        max_value=max(all_dates),
+        key="kw_dates",
+    )
+    if isinstance(date_range, tuple) and len(date_range) == 2:
+        daily_df = daily_df[
+            (daily_df["date"].dt.date >= date_range[0]) & (daily_df["date"].dt.date <= date_range[1])
+        ]
 
     latest = _latest_rank(daily_df)
     dates = sorted(daily_df["date"].unique())
@@ -258,11 +444,7 @@ def render():
         },
     )
 
-    # ---------------------------------------------------------------
-    # AI Overview vs Organic breakdown
-    # ---------------------------------------------------------------
-    st.subheader("SERP Feature Breakdown")
-
+    # Keep type_counts for LLM summary
     type_counts = (
         latest[latest["rank"].notna()]
         .groupby("result_type")
@@ -270,42 +452,6 @@ def render():
         .reset_index(name="keywords")
         .sort_values("keywords", ascending=False)
     )
-
-    col_pie, col_bar = st.columns(2)
-
-    with col_pie:
-        fig_pie = px.pie(
-            type_counts,
-            values="keywords",
-            names="result_type",
-            title="Rankings by SERP Feature",
-            color_discrete_sequence=px.colors.qualitative.Set2,
-        )
-        st.plotly_chart(fig_pie, use_container_width=True)
-
-    with col_bar:
-        # SERP type by rank bucket
-        ranked_all = latest[latest["rank"].notna()].copy()
-        ranked_all["rank_bucket"] = pd.cut(
-            ranked_all["rank"],
-            bins=[0, 3, 10, 20, 50, 200],
-            labels=["#1-3", "#4-10", "#11-20", "#21-50", "#50+"],
-        )
-        bucket_type = (
-            ranked_all.groupby(["rank_bucket", "result_type"], observed=True)
-            .size()
-            .reset_index(name="count")
-        )
-        fig_bucket = px.bar(
-            bucket_type,
-            x="rank_bucket",
-            y="count",
-            color="result_type",
-            title="SERP Feature by Rank Bucket",
-            barmode="stack",
-            labels={"rank_bucket": "Position Range", "count": "Keywords"},
-        )
-        st.plotly_chart(fig_bucket, use_container_width=True)
 
     # ---------------------------------------------------------------
     # Daily rank trends
@@ -342,107 +488,12 @@ def render():
         fig_trend.update_layout(xaxis_tickformat="%b %d")
         st.plotly_chart(fig_trend, use_container_width=True)
 
-    # ---------------------------------------------------------------
-    # Landing page performance
-    # ---------------------------------------------------------------
-    st.subheader("Landing Page Performance")
-
-    page_perf = latest[latest["rank"].notna()].copy()
-    page_perf["page_category"] = page_perf["landing_page"].apply(
-        lambda u: categorize_page(_page_path_from_url(u))
-    )
-
-    cat_agg = (
-        page_perf.groupby("page_category")
-        .agg(
-            keywords=("keyword", "count"),
-            avg_rank=("rank", "mean"),
-            best_rank=("rank", "min"),
+        kw_trend_text = "\n".join(
+            f"  {kw}: rank {int(trend_df[trend_df['keyword']==kw]['rank'].iloc[-1])}"
+            for kw in selected_kws
+            if not trend_df[trend_df['keyword']==kw].empty
         )
-        .reset_index()
-        .sort_values("keywords", ascending=False)
-    )
-    cat_agg["avg_rank"] = cat_agg["avg_rank"].round(1)
-
-    col_chart, col_table = st.columns([2, 1])
-
-    with col_chart:
-        fig_cat = px.bar(
-            cat_agg,
-            x="page_category",
-            y="keywords",
-            text="keywords",
-            title="Keywords Ranking by Page Category",
-            color="page_category",
-        )
-        fig_cat.update_traces(textposition="outside")
-        fig_cat.update_layout(showlegend=False)
-        st.plotly_chart(fig_cat, use_container_width=True)
-
-    with col_table:
-        st.dataframe(
-            cat_agg.rename(columns={
-                "page_category": "Page Category",
-                "keywords": "Keywords",
-                "avg_rank": "Avg Rank",
-                "best_rank": "Best Rank",
-            }),
-            hide_index=True,
-            use_container_width=True,
-        )
-
-    # ---------------------------------------------------------------
-    # Search intent analysis
-    # ---------------------------------------------------------------
-    st.subheader("Performance by Search Intent")
-
-    intent_rows = []
-    for _, row in keywords_df.iterrows():
-        labels = _expand_intents(row.get("intents", ""))
-        for label in labels:
-            intent_rows.append({"keyword": row["keyword"], "intent": label})
-
-    if intent_rows:
-        intent_df = pd.DataFrame(intent_rows).merge(
-            latest[["keyword", "rank"]], on="keyword", how="left"
-        )
-
-        intent_summary = (
-            intent_df.groupby("intent")
-            .agg(
-                total=("keyword", "count"),
-                ranked=("rank", lambda x: x.notna().sum()),
-                avg_rank=("rank", "mean"),
-            )
-            .reset_index()
-        )
-        intent_summary["avg_rank"] = intent_summary["avg_rank"].round(1)
-        intent_summary["rank_rate"] = (
-            (intent_summary["ranked"] / intent_summary["total"] * 100).round(0).astype(int).astype(str) + "%"
-        )
-        intent_summary = intent_summary.sort_values("total", ascending=False)
-
-        fig_intent = px.bar(
-            intent_summary,
-            x="intent",
-            y=["ranked", "total"],
-            title="Ranked vs Total Keywords by Intent",
-            barmode="group",
-            labels={"value": "Keywords", "intent": "Intent"},
-        )
-        st.plotly_chart(fig_intent, use_container_width=True)
-
-        st.dataframe(
-            intent_summary.rename(columns={
-                "intent": "Intent",
-                "total": "Total",
-                "ranked": "Ranked",
-                "avg_rank": "Avg Rank",
-                "rank_rate": "Rank Rate",
-            }),
-            hide_index=True,
-            use_container_width=True,
-        )
+        render_chart_insight("kw_trends", kw_trend_text, "Which keywords improved or declined and what does it suggest?")
 
     # ---------------------------------------------------------------
     # Rank stability
@@ -494,45 +545,27 @@ def render():
     )
 
     if not diff_rank.empty:
-        diff_rank["volume_label"] = diff_rank["search_volume"].apply(
-            lambda v: f"{int(v):,}" if pd.notna(v) else "n/a"
+        diff_rank = diff_rank.sort_values("rank")
+        diff_rank["search_volume"] = diff_rank["search_volume"].apply(
+            lambda v: f"{int(v):,}" if pd.notna(v) and v > 0 else "—"
         )
-        diff_rank["search_volume"] = diff_rank["search_volume"].fillna(0)
-
-        fig_scatter = px.scatter(
-            diff_rank,
-            x="difficulty",
-            y="rank",
-            text="keyword",
-            size="search_volume",
-            size_max=30,
-            title="Difficulty vs Position (bubble size = search volume)",
-            labels={"difficulty": "Keyword Difficulty", "rank": "Position"},
-            hover_data={"volume_label": True, "keyword": False},
+        diff_rank["difficulty"] = diff_rank["difficulty"].apply(
+            lambda v: f"{int(v)}" if pd.notna(v) else "—"
         )
-        fig_scatter.update_traces(textposition="top center", textfont_size=8)
-        fig_scatter.update_yaxes(autorange="reversed")
-        st.plotly_chart(fig_scatter, use_container_width=True)
+        diff_rank["rank"] = diff_rank["rank"].apply(lambda v: f"{v:.1f}" if pd.notna(v) else "—")
 
-    # ---------------------------------------------------------------
-    # LLM Insights
-    # ---------------------------------------------------------------
-    type_summary = type_counts.to_string(index=False) if not type_counts.empty else "N/A"
+        # Add tag column from keywords_df if available
+        if "tags" in keywords_df.columns:
+            tag_map = keywords_df.set_index("keyword")["tags"].to_dict()
+            diff_rank["tag"] = diff_rank["keyword"].map(tag_map).fillna("")
 
-    improved = keywords_df[keywords_df["wow_change"].notna() & (keywords_df["wow_change"] < 0)]
-    declined = keywords_df[keywords_df["wow_change"].notna() & (keywords_df["wow_change"] > 0)]
+        display_cols = {"keyword": "Keyword", "rank": "Rank", "difficulty": "Difficulty", "search_volume": "Volume"}
+        if "tag" in diff_rank.columns:
+            display_cols["tag"] = "Tag"
 
-    top5 = snapshot.nsmallest(5, "rank")
-    top5_str = ", ".join(
-        f"{r['keyword']}(#{int(r['rank'])}, {r['result_type']})"
-        for _, r in top5.iterrows()
-    )
+        st.dataframe(
+            diff_rank[list(display_cols.keys())].rename(columns=display_cols),
+            hide_index=True,
+            use_container_width=True,
+        )
 
-    data_summary = f"""Tracking {total_keywords} keywords, {n_ranked} ranked, {n_unranked} unranked.
-Top 3: {int(n_top3)}, Top 10: {int(n_top10)}
-SERP features: {type_summary}
-Top 5 keywords: {top5_str}
-Improved WoW: {len(improved)}, Declined WoW: {len(declined)}
-Date range: {dates[0].strftime('%Y-%m-%d')} to {dates[-1].strftime('%Y-%m-%d')} ({n_days} days)"""
-
-    render_llm_insights("Keyword Performance", data_summary)

@@ -1,31 +1,19 @@
-"""Search Impressions — Google Search Console data via API.
-
-CSV columns: date, page, query, clicks, impressions, ctr, position
-"""
+"""Search Impressions — Google Search Console data via API."""
 
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-from config import categorize_page, find_gsc_csvs, is_ga4_configured, is_gsc_configured
-from llm import render_llm_insights
+from config import categorize_page, is_ga4_configured, is_gsc_configured
+from db import query_df, upsert_gsc
+from llm import render_chart_insight
 from sections.fetch_button import render_fetch_button as _render_fetch_button
 
 EXPECTED_COLUMNS = ["date", "page", "query", "clicks", "impressions", "ctr", "position"]
 
 
-def _parse_gsc_df(df: pd.DataFrame) -> pd.DataFrame | None:
-    """Validate and enrich a raw GSC dataframe."""
-    df.columns = [c.strip().lower() for c in df.columns]
-
-    missing = [c for c in EXPECTED_COLUMNS if c not in df.columns]
-    if missing:
-        st.error(
-            f"CSV is missing expected columns: {missing}. "
-            f"Expected: {EXPECTED_COLUMNS}"
-        )
-        return None
-
+def _enrich_gsc_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Add derived columns to a GSC dataframe."""
     df["date"] = pd.to_datetime(df["date"])
     df["page_category"] = df["page"].apply(
         lambda p: categorize_page(pd.Series([p]).str.extract(r"https?://[^/]+(/.*)")[0].iloc[0])
@@ -34,20 +22,11 @@ def _parse_gsc_df(df: pd.DataFrame) -> pd.DataFrame | None:
 
 
 def _load_all_gsc_data() -> pd.DataFrame | None:
-    """Load and merge all GSC CSVs in the data directory."""
-    paths = find_gsc_csvs()
-    if not paths:
+    """Load all GSC data from the database."""
+    df = query_df("SELECT date, page, query, clicks, impressions, ctr, position FROM gsc ORDER BY date")
+    if df.empty:
         return None
-    frames = []
-    for p in paths:
-        df = _parse_gsc_df(pd.read_csv(p))
-        if df is not None:
-            frames.append(df)
-    if not frames:
-        return None
-    combined = pd.concat(frames, ignore_index=True)
-    combined = combined.drop_duplicates(subset=["date", "page", "query"])
-    return combined
+    return _enrich_gsc_df(df)
 
 
 def render():
@@ -62,7 +41,7 @@ def render():
             "`GSC_PROPERTY`, and/or `GA4_PROPERTY_ID` in `.env`."
         )
 
-    # --- Load data: all CSVs on disk or file upload fallback ---
+    # --- Load data from DB or CSV upload fallback ---
     df = _load_all_gsc_data()
 
     if df is None:
@@ -72,9 +51,17 @@ def render():
             key="gsc_upload",
             help=f"Expected columns: {', '.join(EXPECTED_COLUMNS)}",
         )
-        if uploaded is None:
-            return
-        df = _parse_gsc_df(pd.read_csv(uploaded))
+        if uploaded is not None:
+            raw = pd.read_csv(uploaded)
+            raw.columns = [c.strip().lower() for c in raw.columns]
+            missing = [c for c in EXPECTED_COLUMNS if c not in raw.columns]
+            if missing:
+                st.error(f"Missing columns: {missing}")
+                return
+            upsert_gsc(raw[EXPECTED_COLUMNS].to_dict("records"))
+            st.success(f"Inserted {len(raw):,} rows.")
+            st.rerun()
+        return
 
     if df is None:
         return
@@ -148,15 +135,19 @@ def render():
         impressions=("impressions", "sum"),
         clicks=("clicks", "sum"),
     ).reset_index()
+    trend["period_label"] = trend["period"].dt.strftime("%b %d")
 
     fig_trend = px.bar(
         trend,
-        x="period",
+        x="period_label",
         y="impressions",
         title=f"{view} Impressions",
-        labels={"period": "Period", "impressions": "Impressions"},
+        labels={"period_label": "Period", "impressions": "Impressions"},
     )
     st.plotly_chart(fig_trend, use_container_width=True)
+
+    trend_summary = "\n".join(f"  {r['period_label']}: {r['impressions']:,.0f}" for _, r in trend.iterrows())
+    render_chart_insight("gsc_trend", trend_summary, "What's driving the week-over-week impressions trend?")
 
     # --- Page category breakdown (latest period with change vs previous) ---
     st.subheader(f"Impressions by Page Category (Latest {period_label})")
@@ -189,36 +180,20 @@ def render():
 
     cat_latest = cat_latest.sort_values("impressions", ascending=False)
 
-    col_chart, col_table = st.columns([2, 1])
-
-    with col_chart:
-        fig_cat = px.bar(
-            cat_latest,
-            x="page_category",
-            y="impressions",
-            text="impressions",
-            title=f"Impressions by Page Category (Latest {period_label})",
-            color="page_category",
-        )
-        fig_cat.update_traces(textposition="outside", texttemplate="%{text:,.0f}")
-        fig_cat.update_layout(showlegend=False)
-        st.plotly_chart(fig_cat, use_container_width=True)
-
-    with col_table:
-        display_cols = {
-            "page_category": "Page Category",
-            "impressions": "Impressions",
-            "clicks": "Clicks",
-            "ctr": "CTR %",
-            "% of total": "% of Total",
-        }
-        if df_prev is not None:
-            display_cols["imp_change"] = "Change"
-        st.dataframe(
-            cat_latest[list(display_cols.keys())].rename(columns=display_cols),
-            hide_index=True,
-            use_container_width=True,
-        )
+    display_cols = {
+        "page_category": "Page Category",
+        "impressions": "Impressions",
+        "clicks": "Clicks",
+        "ctr": "CTR %",
+        "% of total": "% of Total",
+    }
+    if df_prev is not None:
+        display_cols["imp_change"] = "Change"
+    st.dataframe(
+        cat_latest[list(display_cols.keys())].rename(columns=display_cols),
+        hide_index=True,
+        use_container_width=True,
+    )
 
     # --- Page category trend over time ---
     st.subheader(f"Page Category Trend ({view})")
@@ -236,13 +211,3 @@ def render():
         title=f"Impressions by Page Category ({view})",
     )
     st.plotly_chart(fig_cat_trend, use_container_width=True)
-
-    # --- LLM Insights ---
-    top_cats = cat_latest.head(5)
-    change_col = "imp_change" if df_prev is not None else None
-    data_summary = f"""Latest {period_label}: {latest_period.strftime('%d %b %Y')}
-Impressions: {latest_impressions:,.0f}{f' ({imp_delta} vs prev)' if imp_delta else ''}, Clicks: {latest_clicks:,.0f}{f' ({click_delta} vs prev)' if click_delta else ''}, CTR: {latest_ctr:.1f}%{f' ({ctr_delta} vs prev)' if ctr_delta else ''}
-Top page categories by impressions:
-{chr(10).join(f"  {r['page_category']}: {r['impressions']:,.0f} ({r['% of total']}% of total, CTR: {r['ctr']}%)" + (f" [{r['imp_change']}]" if change_col else "") for _, r in top_cats.iterrows())}"""
-
-    render_llm_insights("Search Impressions", data_summary)

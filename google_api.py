@@ -1,9 +1,7 @@
 """Google API integration for fetching GSC and GA4 data."""
 
-import os
 from datetime import date, timedelta
 
-import pandas as pd
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from google.analytics.data_v1beta import BetaAnalyticsDataClient
@@ -15,9 +13,6 @@ from google.analytics.data_v1beta.types import (
 )
 
 from config import (
-    DATA_DIR,
-    gsc_csv_path,
-    ga4_csv_path,
     get_google_credentials_path,
     get_gsc_property,
     get_ga4_property_id,
@@ -41,38 +36,33 @@ def _get_credentials(scopes: list[str]) -> service_account.Credentials:
 
 
 def _date_range(num_weeks: int = 4) -> tuple[str, str]:
-    """Return (start_date, end_date) aligned to ISO week boundaries (Mon–Sun).
+    """Return (start_date, end_date) aligned to ISO week boundaries (Mon-Sun).
 
     GSC data has a ~2-day lag, so the window ends at the last fully
     available Sunday. Fetches *num_weeks* complete weeks.
     """
-    # Find the most recent Sunday that's at least 2 days ago
     ref = date.today() - timedelta(days=2)
-    # ref.isoweekday(): Mon=1 … Sun=7
-    days_since_sunday = ref.isoweekday() % 7  # Sun→0, Mon→1, …, Sat→6
+    days_since_sunday = ref.isoweekday() % 7  # Sun->0, Mon->1, ..., Sat->6
     end = ref - timedelta(days=days_since_sunday)  # last Sunday
-    start = end - timedelta(weeks=num_weeks) + timedelta(days=1)  # Monday, num_weeks ago
+    start = end - timedelta(weeks=num_weeks) + timedelta(days=1)  # Monday
     return start.isoformat(), end.isoformat()
 
 
-def _ensure_data_dir():
-    os.makedirs(DATA_DIR, exist_ok=True)
+def fetch_gsc_data() -> tuple[int, bool]:
+    """Fetch GSC Search Analytics data and write to database.
 
-
-def fetch_gsc_data() -> tuple[str, bool]:
-    """Fetch GSC Search Analytics data and save as CSV.
-
-    Returns (csv_path, already_existed).
+    Returns (row_count, already_existed).
     """
     site_url = get_gsc_property()
     if not site_url:
         raise RuntimeError("GSC_PROPERTY not set in .env")
 
     start_date, end_date = _date_range()
-    csv_path = gsc_csv_path(start_date, end_date)
 
-    if os.path.exists(csv_path):
-        return csv_path, True
+    from db import has_data_for_range, upsert_gsc
+
+    if has_data_for_range("gsc", start_date, end_date):
+        return 0, True
 
     credentials = _get_credentials(GSC_SCOPES)
     service = build("searchconsole", "v1", credentials=credentials)
@@ -123,26 +113,25 @@ def fetch_gsc_data() -> tuple[str, bool]:
             "Check that the service account has access to the property."
         )
 
-    df = pd.DataFrame(all_rows)
-    _ensure_data_dir()
-    df.to_csv(csv_path, index=False)
-    return csv_path, False
+    upsert_gsc(all_rows)
+    return len(all_rows), False
 
 
-def fetch_ga4_data() -> tuple[str, bool]:
-    """Fetch GA4 report data and save as CSV.
+def fetch_ga4_data() -> tuple[int, bool]:
+    """Fetch GA4 report data and write to database.
 
-    Returns (csv_path, already_existed).
+    Returns (row_count, already_existed).
     """
     property_id = get_ga4_property_id()
     if not property_id:
         raise RuntimeError("GA4_PROPERTY_ID not set in .env")
 
     start_date, end_date = _date_range()
-    csv_path = ga4_csv_path(start_date, end_date)
 
-    if os.path.exists(csv_path):
-        return csv_path, True
+    from db import has_data_for_range, upsert_ga4
+
+    if has_data_for_range("ga4", start_date, end_date):
+        return 0, True
 
     credentials = _get_credentials(GA4_SCOPES)
     client = BetaAnalyticsDataClient(credentials=credentials)
@@ -195,7 +184,5 @@ def fetch_ga4_data() -> tuple[str, bool]:
             "Check that the service account has access to the property."
         )
 
-    df = pd.DataFrame(all_rows)
-    _ensure_data_dir()
-    df.to_csv(csv_path, index=False)
-    return csv_path, False
+    upsert_ga4(all_rows)
+    return len(all_rows), False

@@ -1,8 +1,7 @@
 """GEO Performance — Profound data analysis."""
 
-import os
+import json
 import re
-from datetime import date
 from urllib.parse import urlparse
 
 import pandas as pd
@@ -13,13 +12,12 @@ import streamlit as st
 from config import (
     COMPETITOR_DOMAINS,
     COMPETITOR_NAMES,
-    DATA_DIR,
     OWNED_DOMAINS,
     TOPIC_COMPETITORS,
     categorize_page,
-    find_profound_csvs,
 )
-from llm import render_llm_insights
+from db import query_df, upsert_profound
+from llm import render_chart_insight
 
 PLATFORMS = ["ChatGPT", "Google AI Overviews", "Perplexity"]
 
@@ -28,25 +26,70 @@ PLATFORMS = ["ChatGPT", "Google AI Overviews", "Perplexity"]
 # Data helpers
 # ---------------------------------------------------------------------------
 
-def _load_profound_data(uploaded_file) -> pd.DataFrame:
-    df = pd.read_csv(uploaded_file)
+
+def _load_profound_data_from_db() -> pd.DataFrame | None:
+    """Load all Profound data from database."""
+    df = query_df("""
+        SELECT date, topic, prompt, platform, position, mentioned, mentions,
+               citations, response, run_id, platform_id, tags, region,
+               persona, type, search_queries, normalized_mentions
+        FROM profound ORDER BY date
+    """)
+    if df.empty:
+        return None
     df["date"] = pd.to_datetime(df["date"])
     return df
 
 
-def _citation_columns(df: pd.DataFrame) -> list[str]:
-    return [c for c in df.columns if re.match(r"citation_\d+", c)]
+def _parse_profound_csv_for_db(uploaded_file) -> list[dict]:
+    """Parse a Profound CSV and return rows ready for DB upsert."""
+    df = pd.read_csv(uploaded_file)
+    cit_cols = [c for c in df.columns if re.match(r"citation_\d+", c)]
+
+    rows = []
+    for _, row in df.iterrows():
+        citations = []
+        for c in cit_cols:
+            v = row.get(c)
+            if isinstance(v, str) and v.startswith("http"):
+                citations.append(v)
+
+        mentioned_raw = str(row.get("mentioned?", "")).lower()
+        mentioned = mentioned_raw in ("yes", "true", "1")
+
+        rows.append({
+            "date": str(row["date"]),
+            "topic": str(row.get("topic", "")),
+            "prompt": str(row.get("prompt", "")),
+            "platform": str(row.get("platform", "")),
+            "position": str(row.get("position", "")),
+            "mentioned": mentioned,
+            "mentions": str(row.get("mentions", "") if pd.notna(row.get("mentions")) else ""),
+            "normalized_mentions": str(row.get("normalized_mentions", "") if pd.notna(row.get("normalized_mentions")) else ""),
+            "citations": json.dumps(citations),
+            "response": str(row.get("response", "") if pd.notna(row.get("response")) else ""),
+            "run_id": str(row.get("run_id", "") if pd.notna(row.get("run_id")) else ""),
+            "platform_id": str(row.get("platformId", "") if pd.notna(row.get("platformId")) else ""),
+            "tags": str(row.get("tags", "") if pd.notna(row.get("tags")) else ""),
+            "region": str(row.get("region", "") if pd.notna(row.get("region")) else ""),
+            "persona": str(row.get("persona", "") if pd.notna(row.get("persona")) else ""),
+            "type": str(row.get("type", "") if pd.notna(row.get("type")) else ""),
+            "search_queries": str(row.get("search_queries", "") if pd.notna(row.get("search_queries")) else ""),
+        })
+    return rows
 
 
 def _is_mentioned(df: pd.DataFrame) -> pd.Series:
     """Boolean series: was our brand mentioned by name?"""
-    return df["mentioned?"].astype(str).str.lower().isin(["yes", "true", "1"])
+    return df["mentioned"].astype(bool)
 
 
-def _has_domain(row, domain_set: set, cit_cols: list[str]) -> bool:
+def _has_domain(row, domain_set: set) -> bool:
     """Check if any citation URL belongs to one of the given domains."""
-    for c in cit_cols:
-        v = row[c]
+    citations = row.get("citations", [])
+    if not isinstance(citations, list):
+        return False
+    for v in citations:
         if not isinstance(v, str) or not v.startswith("http"):
             continue
         try:
@@ -58,17 +101,18 @@ def _has_domain(row, domain_set: set, cit_cols: list[str]) -> bool:
     return False
 
 
-def _extract_owned_urls(df: pd.DataFrame, cit_cols: list[str]) -> pd.Series:
-    """Extract all owned-domain URLs from citation columns. Returns a Series of URLs."""
+def _extract_owned_urls(df: pd.DataFrame) -> pd.Series:
+    """Extract all owned-domain URLs from the citations JSONB column."""
     urls = []
-    for c in cit_cols:
-        for v in df[c].dropna():
+    for citations in df["citations"]:
+        if not isinstance(citations, list):
+            continue
+        for v in citations:
             if not isinstance(v, str) or not v.startswith("http"):
                 continue
             try:
                 h = urlparse(v).netloc.lower().removeprefix("www.")
                 if any(h == d or h.endswith("." + d) for d in OWNED_DOMAINS):
-                    # Normalize: strip query params and trailing slash
                     parsed = urlparse(v)
                     clean = f"{parsed.scheme}://{parsed.netloc}{parsed.path.rstrip('/')}"
                     urls.append(clean)
@@ -99,22 +143,9 @@ def _extract_comp_names(mentions_series: pd.Series) -> pd.Series:
 # Render
 # ---------------------------------------------------------------------------
 
-def _save_upload(uploaded_file) -> str:
-    """Save uploaded Profound CSV to data/ and return the path."""
-    os.makedirs(DATA_DIR, exist_ok=True)
-    name = f"profound_{date.today().isoformat()}_{uploaded_file.name}"
-    path = os.path.join(DATA_DIR, name)
-    uploaded_file.seek(0)
-    with open(path, "wb") as f:
-        f.write(uploaded_file.read())
-    uploaded_file.seek(0)
-    return path
-
 
 def render():
     st.header("GEO Performance — Profound Data")
-
-    saved = find_profound_csvs()
 
     uploaded = st.file_uploader(
         "Upload Profound CSV (raw data with citations)",
@@ -123,21 +154,20 @@ def render():
     )
 
     if uploaded is not None:
-        save_path = _save_upload(uploaded)
-        st.caption(f"Saved to `{save_path}`")
-        df = _load_profound_data(uploaded)
-    elif saved:
-        st.caption(f"Loaded from `{saved[-1]}`")
-        df = _load_profound_data(saved[-1])
-    else:
-        st.info("Upload a Profound CSV export to see GEO analysis.")
+        rows = _parse_profound_csv_for_db(uploaded)
+        upsert_profound(rows)
+        st.success(f"Inserted {len(rows):,} rows.")
+
+    df = _load_profound_data_from_db()
+    if df is None:
+        if uploaded is None:
+            st.info("Upload a Profound CSV export to see GEO analysis.")
         return
 
     # Pre-compute derived columns once
-    cit_cols = _citation_columns(df)
     df["is_mentioned"] = _is_mentioned(df)
     df["has_fp_citation"] = df.apply(
-        lambda row: _has_domain(row, OWNED_DOMAINS, cit_cols), axis=1
+        lambda row: _has_domain(row, OWNED_DOMAINS), axis=1
     )
     df["comp_mentioned"] = df["mentions"].apply(_comp_mentioned)
 
@@ -181,7 +211,7 @@ def render():
     prompts_appeared = mentioned["prompt"].nunique()
 
     # Count unique owned articles cited
-    owned_urls = _extract_owned_urls(filtered, cit_cols)
+    owned_urls = _extract_owned_urls(filtered)
     unique_articles_cited = owned_urls.nunique() if not owned_urls.empty else 0
 
     m1, m2, m3, m4 = st.columns(4)
@@ -253,13 +283,6 @@ def render():
         overlap_data.append(row)
 
     overlap_df = pd.DataFrame(overlap_data, index=PLATFORMS)
-    fig_heatmap = px.imshow(
-        overlap_df,
-        text_auto=True,
-        title="Platform Overlap (shared prompt mentions)",
-        color_continuous_scale="Blues",
-    )
-    st.plotly_chart(fig_heatmap, use_container_width=True)
 
     # --- Our Articles Cited ---
     st.subheader("Our Articles Cited")
@@ -305,30 +328,6 @@ def render():
         cat_cited.columns = ["Page Category", "Unique Pages", "Total Citations"]
         st.write("**Citations by page category:**")
         st.dataframe(cat_cited, hide_index=True, use_container_width=True)
-
-    # --- Position distribution ---
-    st.subheader("Position Distribution")
-
-    positioned = mentioned[mentioned["position"].astype(str).str.strip() != ""].copy()
-    if not positioned.empty:
-        positioned["position_num"] = (
-            positioned["position"].astype(str).str.replace("#", "").astype(int)
-        )
-        fig_pos = px.histogram(
-            positioned,
-            x="position_num",
-            color="platform",
-            barmode="group",
-            nbins=15,
-            title="Distribution of Mention Positions by Platform",
-            labels={"position_num": "Position", "count": "Count"},
-        )
-        st.plotly_chart(fig_pos, use_container_width=True)
-
-        avg_pos = positioned.groupby("platform")["position_num"].mean()
-        st.write("**Average position by platform:**")
-        for platform, pos in avg_pos.items():
-            st.write(f"- {platform}: #{pos:.1f}")
 
     # ------------------------------------------------------------------
     # COMPETITOR MENTIONS — replaces old "Most Cited Pages" section
@@ -377,89 +376,22 @@ def render():
                 pd.DataFrame(comp_by_platform), hide_index=True, use_container_width=True
             )
 
-    # ------------------------------------------------------------------
-    # CITE vs MENTION GAP
-    # ------------------------------------------------------------------
-    st.subheader("Cited but Not Mentioned")
-    st.caption(
-        "Prompts where our URL appears in citations but our brand isn't mentioned "
-        "by name — the best targets for improving brand visibility."
-    )
-
-    # Per-prompt stats
+    # Keep gap_prompts for LLM summary
     prompt_stats = (
         filtered.groupby(["topic", "prompt"])
         .agg(
             total=("is_mentioned", "size"),
             mentioned_count=("is_mentioned", "sum"),
             cited_count=("has_fp_citation", "sum"),
-            comp_mention_count=("comp_mentioned", "sum"),
         )
         .reset_index()
     )
     prompt_stats["mention_rate"] = prompt_stats["mentioned_count"] / prompt_stats["total"]
     prompt_stats["cite_rate"] = prompt_stats["cited_count"] / prompt_stats["total"]
     prompt_stats["gap"] = prompt_stats["cite_rate"] - prompt_stats["mention_rate"]
-
-    # Only show prompts where we ARE cited but gap > 0
     gap_prompts = prompt_stats[
         (prompt_stats["cited_count"] > 0) & (prompt_stats["gap"] > 0)
     ].sort_values("gap", ascending=False)
-
-    if gap_prompts.empty:
-        st.success("No cite-but-not-mentioned gaps found — great brand visibility!")
-    else:
-        top_gaps = gap_prompts.head(15).copy()
-        top_gaps["label"] = top_gaps["prompt"].str[:60]
-
-        fig_gap = go.Figure()
-        fig_gap.add_trace(
-            go.Bar(
-                y=top_gaps["label"],
-                x=top_gaps["cite_rate"],
-                name="Citation Rate",
-                orientation="h",
-                marker_color="#93c5fd",
-            )
-        )
-        fig_gap.add_trace(
-            go.Bar(
-                y=top_gaps["label"],
-                x=top_gaps["mention_rate"],
-                name="Mention Rate",
-                orientation="h",
-                marker_color="#3b82f6",
-            )
-        )
-        fig_gap.update_layout(
-            title="Biggest Citation → Mention Gaps (Top 15)",
-            barmode="overlay",
-            yaxis={"categoryorder": "array", "categoryarray": top_gaps["label"][::-1].tolist()},
-            xaxis_title="Rate",
-            legend=dict(orientation="h", yanchor="bottom", y=1.02),
-        )
-        st.plotly_chart(fig_gap, use_container_width=True)
-
-        # Platform breakdown of the gap
-        platform_gap = (
-            filtered.groupby("platform")
-            .agg(
-                total=("is_mentioned", "size"),
-                mentioned=("is_mentioned", "sum"),
-                cited=("has_fp_citation", "sum"),
-            )
-            .reset_index()
-        )
-        platform_gap["mention_rate"] = platform_gap["mentioned"] / platform_gap["total"]
-        platform_gap["cite_rate"] = platform_gap["cited"] / platform_gap["total"]
-        platform_gap["gap"] = platform_gap["cite_rate"] - platform_gap["mention_rate"]
-
-        st.write("**Citation → Mention gap by platform:**")
-        display_gap = platform_gap[["platform", "cite_rate", "mention_rate", "gap"]].copy()
-        display_gap.columns = ["Platform", "Citation Rate", "Mention Rate", "Gap"]
-        for col in ["Citation Rate", "Mention Rate", "Gap"]:
-            display_gap[col] = display_gap[col].map(lambda x: f"{x:.1%}")
-        st.dataframe(display_gap, hide_index=True, use_container_width=True)
 
     # ------------------------------------------------------------------
     # HEAD-TO-HEAD COMPETITOR COMPARISON
@@ -579,6 +511,16 @@ def render():
         else:
             st.success(f"No contested prompts — {topic} leads on all tracked prompts!")
 
+    # Insight for head-to-head
+    comp_summary = ""
+    if not comp_names.empty:
+        top3 = comp_names.value_counts().head(3)
+        comp_summary = "\n".join(f"  {n}: {c}x" for n, c in top3.items())
+    h2h_text = f"""Mention rate: {prompts_appeared}/{total_prompts} ({prompts_appeared/total_prompts*100:.0f}%)
+Per platform: {', '.join(f"{s['Platform']}: {s['Mentioned']}/{s['Total Prompts']}" for s in platform_stats)}
+Top competitors:\n{comp_summary}"""
+    render_chart_insight("h2h_competitors", h2h_text, "How are we performing vs competitors across AI platforms?")
+
     # --- Prompt-level detail table ---
     st.subheader("Prompt Detail")
 
@@ -600,26 +542,3 @@ def render():
     prompt_pivot = prompt_pivot.sort_values("Mentioned On", ascending=False)
 
     st.dataframe(prompt_pivot, use_container_width=True)
-
-    # --- LLM Insights ---
-    # Build summary including new mention-focused data
-    comp_summary = ""
-    if not comp_names.empty:
-        top3 = comp_names.value_counts().head(3)
-        comp_summary = f"\nTop competitors mentioned: {', '.join(f'{n} ({c}x)' for n, c in top3.items())}"
-
-    gap_summary = ""
-    if not gap_prompts.empty:
-        gap_summary = (
-            f"\nCite-but-not-mentioned prompts: {len(gap_prompts)}"
-            f", biggest gaps: {', '.join(gap_prompts['prompt'].head(3).tolist())}"
-        )
-
-    articles_summary = f"\nOwned articles cited: {unique_articles_cited}"
-
-    data_summary = f"""Topic: {selected_topic}
-Total prompts: {total_prompts}, Mentioned in: {prompts_appeared} ({prompts_appeared/total_prompts*100:.0f}%)
-Per platform: {', '.join(f"{s['Platform']}: {s['Mentioned']}/{s['Total Prompts']}" for s in platform_stats)}
-Cross-platform: All 3: {all_three}, At least 2: {at_least_two}, Only 1: {exactly_one}{articles_summary}{comp_summary}{gap_summary}"""
-
-    render_llm_insights("GEO Performance", data_summary)

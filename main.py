@@ -1,17 +1,12 @@
 """Weekly Metrics Dashboard — Streamlit entry point."""
 
-import os
-from datetime import date, datetime
+import atexit
+from datetime import date
 
 import streamlit as st
 
-from config import (
-    DATA_DIR,
-    find_ga4_csvs,
-    find_gsc_csvs,
-    is_ga4_configured,
-    is_gsc_configured,
-)
+from config import is_ga4_configured, is_gsc_configured
+from db import get_pool, close_pool, latest_data_date
 
 st.set_page_config(
     page_title="Weekly Metrics Dashboard",
@@ -19,18 +14,22 @@ st.set_page_config(
     layout="wide",
 )
 
+# Initialize DB connection pool
+get_pool()
+atexit.register(close_pool)
+
 st.title("Weekly Metrics Dashboard")
 
 # --- Stale data warning ---
-def _latest_csv_age(paths: list[str]) -> int | None:
-    """Return age in days of the most recently modified CSV, or None."""
-    if not paths:
+def _data_age_days(table: str) -> int | None:
+    """Return age in days of the newest row in the table, or None if empty."""
+    latest = latest_data_date(table)
+    if latest is None:
         return None
-    newest = max(os.path.getmtime(p) for p in paths)
-    return (datetime.now() - datetime.fromtimestamp(newest)).days
+    return (date.today() - latest).days
 
-gsc_age = _latest_csv_age(find_gsc_csvs())
-ga4_age = _latest_csv_age(find_ga4_csvs())
+gsc_age = _data_age_days("gsc")
+ga4_age = _data_age_days("ga4")
 
 stale = []
 if gsc_age is not None and gsc_age > 7:
@@ -54,7 +53,6 @@ def _build_section_summaries() -> dict[str, str]:
     from sections.search_impressions import _load_all_gsc_data
     gsc_df = _load_all_gsc_data()
     if gsc_df is not None and not gsc_df.empty:
-        from config import categorize_page
         gsc_df["period"] = gsc_df["date"].dt.to_period("W").apply(lambda r: r.start_time)
         periods = sorted(gsc_df["period"].unique())
         latest = gsc_df[gsc_df["period"] == periods[-1]]

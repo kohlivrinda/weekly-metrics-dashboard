@@ -1,6 +1,5 @@
 """Configuration and page category mapping."""
 
-import glob
 import os
 
 from dotenv import load_dotenv
@@ -114,38 +113,9 @@ TOPIC_COMPETITORS = {
     "Maxim": ["langfuse", "langsmith", "braintrust", "arize", "helicone"],
 }
 
-# Data directory
-DATA_DIR = "data"
-
-
-def gsc_csv_path(start_date: str, end_date: str) -> str:
-    """Return path for a GSC CSV covering a specific date range."""
-    return os.path.join(DATA_DIR, f"gsc_{start_date}_to_{end_date}.csv")
-
-
-def ga4_csv_path(start_date: str, end_date: str) -> str:
-    """Return path for a GA4 CSV covering a specific date range."""
-    return os.path.join(DATA_DIR, f"ga4_{start_date}_to_{end_date}.csv")
-
-
-def find_gsc_csvs() -> list[str]:
-    """Return all GSC CSV paths in the data directory, sorted by name."""
-    return sorted(glob.glob(os.path.join(DATA_DIR, "gsc_*.csv")))
-
-
-def find_ga4_csvs() -> list[str]:
-    """Return all GA4 CSV paths in the data directory, sorted by name."""
-    return sorted(glob.glob(os.path.join(DATA_DIR, "ga4_*.csv")))
-
-
-def find_keyword_csvs() -> list[str]:
-    """Return all keyword performance CSV paths, sorted by name (newest last)."""
-    return sorted(glob.glob(os.path.join(DATA_DIR, "keywords_*.csv")))
-
-
-def find_profound_csvs() -> list[str]:
-    """Return all Profound CSV paths, sorted by name (newest last)."""
-    return sorted(glob.glob(os.path.join(DATA_DIR, "profound_*.csv")))
+def get_database_url() -> str | None:
+    """Return DATABASE_URL from environment, or None if not set."""
+    return os.getenv("DATABASE_URL")
 
 
 def get_google_credentials_path() -> str | None:

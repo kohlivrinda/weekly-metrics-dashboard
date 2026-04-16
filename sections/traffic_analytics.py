@@ -1,14 +1,12 @@
-"""Traffic Analytics — Google Analytics (GA4) data via API.
-
-CSV columns: date, page_path, session_source, session_medium, sessions
-"""
+"""Traffic Analytics — Google Analytics (GA4) data via API."""
 
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-from config import categorize_page, find_ga4_csvs, is_ga4_configured, is_gsc_configured
-from llm import render_llm_insights
+from config import categorize_page, is_ga4_configured, is_gsc_configured
+from db import query_df, upsert_ga4
+from llm import render_chart_insight
 from sections.fetch_button import render_fetch_button as _render_fetch_button
 
 EXPECTED_COLUMNS = [
@@ -25,44 +23,23 @@ GEO_SOURCES = ["chatgpt.com", "claude.ai", "perplexity.ai", "gemini.google.com"]
 KEY_SOURCES = ["google", "github", "(direct)", "youtube", "reddit", "linkedin"]
 
 
-def _parse_ga4_df(df: pd.DataFrame) -> pd.DataFrame | None:
-    """Validate and enrich a raw GA4 dataframe."""
-    df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
-
-    missing = [c for c in EXPECTED_COLUMNS if c not in df.columns]
-    if missing:
-        st.error(
-            f"CSV is missing expected columns: {missing}. "
-            f"Expected at minimum: {EXPECTED_COLUMNS}"
-        )
-        return None
-
+def _enrich_ga4_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Add derived columns to a GA4 dataframe."""
     df["date"] = pd.to_datetime(df["date"])
     df["page_category"] = df["page_path"].apply(categorize_page)
     df["sessions"] = pd.to_numeric(df["sessions"], errors="coerce").fillna(0)
     df["source_normalized"] = df["session_source"].str.lower().str.strip()
-
     return df
 
 
 def _load_all_ga4_data() -> pd.DataFrame | None:
-    """Load and merge all GA4 CSVs in the data directory."""
-    paths = find_ga4_csvs()
-    if not paths:
+    """Load all GA4 data from the database."""
+    df = query_df(
+        "SELECT date, page_path, session_source, session_medium, sessions FROM ga4 ORDER BY date"
+    )
+    if df.empty:
         return None
-    frames = []
-    for p in paths:
-        df = _parse_ga4_df(pd.read_csv(p))
-        if df is not None:
-            frames.append(df)
-    if not frames:
-        return None
-    combined = pd.concat(frames, ignore_index=True)
-    dedup_cols = ["date", "page_path", "session_source"]
-    if "session_medium" in combined.columns:
-        dedup_cols.append("session_medium")
-    combined = combined.drop_duplicates(subset=dedup_cols)
-    return combined
+    return _enrich_ga4_df(df)
 
 
 def render():
@@ -77,7 +54,7 @@ def render():
             "`GSC_PROPERTY`, and/or `GA4_PROPERTY_ID` in `.env`."
         )
 
-    # --- Load data: all CSVs on disk or file upload fallback ---
+    # --- Load data from DB or CSV upload fallback ---
     df = _load_all_ga4_data()
 
     if df is None:
@@ -87,9 +64,19 @@ def render():
             key="ga4_upload",
             help=f"Expected columns: {', '.join(EXPECTED_COLUMNS)}",
         )
-        if uploaded is None:
-            return
-        df = _parse_ga4_df(pd.read_csv(uploaded))
+        if uploaded is not None:
+            raw = pd.read_csv(uploaded)
+            raw.columns = [c.strip().lower().replace(" ", "_") for c in raw.columns]
+            missing = [c for c in EXPECTED_COLUMNS if c not in raw.columns]
+            if missing:
+                st.error(f"Missing columns: {missing}")
+                return
+            if "session_medium" not in raw.columns:
+                raw["session_medium"] = ""
+            upsert_ga4(raw[["date", "page_path", "session_source", "session_medium", "sessions"]].to_dict("records"))
+            st.success(f"Inserted {len(raw):,} rows.")
+            st.rerun()
+        return
 
     if df is None:
         return
@@ -162,29 +149,14 @@ def render():
                 axis=1,
             )
 
-        col_chart, col_table = st.columns([2, 1])
-        with col_chart:
-            fig_med = px.bar(
-                med_latest,
-                x=medium_col,
-                y="sessions",
-                text="sessions",
-                title="Sessions by Medium",
-                color=medium_col,
-            )
-            fig_med.update_traces(texttemplate="%{text:,.0f}", textposition="outside")
-            fig_med.update_layout(showlegend=False)
-            st.plotly_chart(fig_med, use_container_width=True)
-
-        with col_table:
-            med_display = {medium_col: "Medium", "sessions": "Sessions"}
-            if df_prev is not None:
-                med_display["change"] = "Change"
-            st.dataframe(
-                med_latest[list(med_display.keys())].rename(columns=med_display),
-                hide_index=True,
-                use_container_width=True,
-            )
+        med_display = {medium_col: "Medium", "sessions": "Sessions"}
+        if df_prev is not None:
+            med_display["change"] = "Change"
+        st.dataframe(
+            med_latest[list(med_display.keys())].rename(columns=med_display),
+            hide_index=True,
+            use_container_width=True,
+        )
 
     # --- Sessions by source (latest period with change) ---
     st.subheader(f"Sessions by Source (Latest {period_label})")
@@ -210,19 +182,6 @@ def render():
             axis=1,
         )
 
-    fig_sources = px.bar(
-        source_latest.head(15),
-        x="sessions",
-        y="session_source",
-        orientation="h",
-        title="Top 15 Session Sources",
-        text="sessions",
-    )
-    fig_sources.update_traces(texttemplate="%{text:,.0f}", textposition="outside")
-    fig_sources.update_layout(yaxis={"categoryorder": "total ascending"})
-    st.plotly_chart(fig_sources, use_container_width=True)
-
-    # Source table with change column
     src_display = {"session_source": "Source", "sessions": "Sessions"}
     if df_prev is not None:
         src_display["change"] = "Change"
@@ -252,6 +211,10 @@ def render():
     )
     st.plotly_chart(fig_source_trend, use_container_width=True)
 
+    src_trend_summary = source_trend.groupby("session_source")["sessions"].agg(["first", "last"]).reset_index()
+    src_trend_text = "\n".join(f"  {r['session_source']}: {int(r['first']):,} → {int(r['last']):,}" for _, r in src_trend_summary.iterrows())
+    render_chart_insight("source_trend", src_trend_text, "What's driving changes in traffic sources?")
+
     # --- Page category breakdown (latest period with change) ---
     st.subheader(f"Sessions by Page Category (Latest {period_label})")
 
@@ -276,29 +239,14 @@ def render():
             axis=1,
         )
 
-    col_chart, col_table = st.columns([2, 1])
-    with col_chart:
-        fig_cats = px.bar(
-            cat_latest,
-            x="page_category",
-            y="sessions",
-            text="sessions",
-            title=f"Sessions by Page Category (Latest {period_label})",
-            color="page_category",
-        )
-        fig_cats.update_traces(texttemplate="%{text:,.0f}", textposition="outside")
-        fig_cats.update_layout(showlegend=False)
-        st.plotly_chart(fig_cats, use_container_width=True)
-
-    with col_table:
-        cat_display = {"page_category": "Page Category", "sessions": "Sessions"}
-        if df_prev is not None:
-            cat_display["change"] = "Change"
-        st.dataframe(
-            cat_latest[list(cat_display.keys())].rename(columns=cat_display),
-            hide_index=True,
-            use_container_width=True,
-        )
+    cat_display = {"page_category": "Page Category", "sessions": "Sessions"}
+    if df_prev is not None:
+        cat_display["change"] = "Change"
+    st.dataframe(
+        cat_latest[list(cat_display.keys())].rename(columns=cat_display),
+        hide_index=True,
+        use_container_width=True,
+    )
 
     # --- Per-source landing page drill-down ---
     st.subheader("Landing Page Breakdown by Source")
@@ -366,23 +314,6 @@ def render():
             delta = row.get("change") if "change" in geo_by_source.columns else None
             col.metric(row["session_source"], f"{int(row['sessions']):,}", delta=delta)
 
-        # GEO per-source page category breakdown
-        geo_cat = (
-            geo_latest.groupby(["session_source", "page_category"])["sessions"]
-            .sum()
-            .reset_index()
-        )
-        fig_geo_cat = px.bar(
-            geo_cat,
-            x="session_source",
-            y="sessions",
-            color="page_category",
-            title="AI Source Traffic by Page Category",
-            barmode="stack",
-            text="sessions",
-        )
-        st.plotly_chart(fig_geo_cat, use_container_width=True)
-
         # GEO trend (full data)
         geo_all = df[df["source_normalized"].isin(GEO_SOURCES)]
         geo_trend = (
@@ -400,28 +331,8 @@ def render():
         )
         st.plotly_chart(fig_geo_trend, use_container_width=True)
 
-    # --- LLM Insights ---
-    top_5_sources = source_latest.head(5)
-    change_info = ""
-    if df_prev is not None and "change" in source_latest.columns:
-        change_info = " | ".join(
-            f"{r['session_source']}: {r['change']}"
-            for _, r in top_5_sources.iterrows()
+        geo_trend_text = "\n".join(
+            f"  {r['session_source']}: {int(r['sessions']):,}"
+            for _, r in geo_by_source.iterrows()
         )
-        change_info = f"\nSource changes vs prev {period_label.lower()}: {change_info}"
-
-    geo_summary = ""
-    if not geo_latest.empty:
-        geo_lines = []
-        for _, r in geo_by_source.iterrows():
-            line = f"{r['session_source']}: {int(r['sessions']):,}"
-            if "change" in geo_by_source.columns:
-                line += f" ({r['change']})"
-            geo_lines.append(line)
-        geo_summary = f"\nAI source traffic: {', '.join(geo_lines)}"
-
-    data_summary = f"""Latest {period_label} sessions: {latest_sessions:,.0f}{f' ({session_delta} vs prev)' if session_delta else ''}
-Top sources: {', '.join(f"{r['session_source']}({int(r['sessions']):,})" for _, r in top_5_sources.iterrows())}{change_info}
-Page categories: {', '.join(f"{r['page_category']}({int(r['sessions']):,})" for _, r in cat_latest.head(5).iterrows())}{geo_summary}"""
-
-    render_llm_insights("Traffic Analytics", data_summary)
+        render_chart_insight("geo_trend", geo_trend_text, "What's the AI traffic trajectory and what does it mean?")
