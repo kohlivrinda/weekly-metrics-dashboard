@@ -13,7 +13,7 @@ from google.analytics.data_v1beta.types import (
 )
 
 from config import (
-    get_google_credentials_path,
+    get_google_credentials,
     get_gsc_property,
     get_ga4_property_id,
 )
@@ -23,15 +23,19 @@ GA4_SCOPES = ["https://www.googleapis.com/auth/analytics.readonly"]
 
 
 def _get_credentials(scopes: list[str]) -> service_account.Credentials:
-    """Build service account credentials from the JSON key file."""
-    key_path = get_google_credentials_path()
-    if key_path is None:
+    """Build service account credentials from JSON key file or string."""
+    creds = get_google_credentials()
+    if creds is None:
         raise RuntimeError(
             "Google service account key not configured. "
             "Set GOOGLE_SERVICE_ACCOUNT_JSON in .env"
         )
+    if isinstance(creds, dict):
+        return service_account.Credentials.from_service_account_info(
+            creds, scopes=scopes
+        )
     return service_account.Credentials.from_service_account_file(
-        key_path, scopes=scopes
+        creds, scopes=scopes
     )
 
 

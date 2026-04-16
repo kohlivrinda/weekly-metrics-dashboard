@@ -118,14 +118,25 @@ def get_database_url() -> str | None:
     return os.getenv("DATABASE_URL")
 
 
-def get_google_credentials_path() -> str | None:
-    """Return path to service account JSON, or None if not configured."""
-    path = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
-    if not path or path.startswith("path/to"):
+def get_google_credentials() -> dict | str | None:
+    """Return Google service account credentials.
+
+    Returns:
+        - A dict if GOOGLE_SERVICE_ACCOUNT_JSON contains a JSON string (deployment)
+        - A file path string if it points to an existing file (local dev)
+        - None if not configured
+    """
+    val = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+    if not val or val.startswith("path/to"):
         return None
-    if not os.path.exists(path):
+    # If it looks like JSON, parse it
+    if val.strip().startswith("{"):
+        import json
+        return json.loads(val)
+    # Otherwise treat as file path
+    if not os.path.exists(val):
         return None
-    return path
+    return val
 
 
 def get_gsc_property() -> str | None:
@@ -137,10 +148,10 @@ def get_ga4_property_id() -> str | None:
 
 
 def is_gsc_configured() -> bool:
-    """True if GSC env vars are set and the key file exists."""
-    return get_google_credentials_path() is not None and get_gsc_property() is not None
+    """True if GSC env vars are set and credentials are available."""
+    return get_google_credentials() is not None and get_gsc_property() is not None
 
 
 def is_ga4_configured() -> bool:
-    """True if GA4 env vars are set and the key file exists."""
-    return get_google_credentials_path() is not None and get_ga4_property_id() is not None
+    """True if GA4 env vars are set and credentials are available."""
+    return get_google_credentials() is not None and get_ga4_property_id() is not None
