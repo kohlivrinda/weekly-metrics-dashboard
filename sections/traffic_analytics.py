@@ -32,10 +32,12 @@ def _enrich_ga4_df(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+@st.cache_data(ttl=300)
 def _load_all_ga4_data() -> pd.DataFrame | None:
-    """Load all GA4 data from the database."""
+    """Load GA4 data from the database (last 8 weeks max)."""
     df = query_df(
-        "SELECT date, page_path, session_source, session_medium, sessions FROM ga4 ORDER BY date"
+        "SELECT date, page_path, session_source, session_medium, sessions "
+        "FROM ga4 WHERE date >= CURRENT_DATE - INTERVAL '56 days' ORDER BY date"
     )
     if df.empty:
         return None
@@ -155,7 +157,7 @@ def render():
         st.dataframe(
             med_latest[list(med_display.keys())].rename(columns=med_display),
             hide_index=True,
-            use_container_width=True,
+            width="stretch",
         )
 
     # --- Sessions by source (latest period with change) ---
@@ -188,7 +190,7 @@ def render():
     st.dataframe(
         source_latest.head(15)[list(src_display.keys())].rename(columns=src_display),
         hide_index=True,
-        use_container_width=True,
+        width="stretch",
     )
 
     # --- Source trend over time ---
@@ -209,7 +211,7 @@ def render():
         title=f"Top Sources Over Time ({view})",
         markers=True,
     )
-    st.plotly_chart(fig_source_trend, use_container_width=True)
+    st.plotly_chart(fig_source_trend, width="stretch")
 
     src_trend_summary = source_trend.groupby("session_source")["sessions"].agg(["first", "last"]).reset_index()
     src_trend_text = "\n".join(f"  {r['session_source']}: {int(r['first']):,} → {int(r['last']):,}" for _, r in src_trend_summary.iterrows())
@@ -245,7 +247,7 @@ def render():
     st.dataframe(
         cat_latest[list(cat_display.keys())].rename(columns=cat_display),
         hide_index=True,
-        use_container_width=True,
+        width="stretch",
     )
 
     # --- Per-source landing page drill-down ---
@@ -276,7 +278,7 @@ def render():
     )
     fig_drill.update_traces(texttemplate="%{text:,.0f}", textposition="outside")
     fig_drill.update_layout(showlegend=False)
-    st.plotly_chart(fig_drill, use_container_width=True)
+    st.plotly_chart(fig_drill, width="stretch")
 
     # --- GEO Traffic (AI sources) ---
     st.subheader(f"GEO Traffic — AI Sources (Latest {period_label})")
@@ -329,7 +331,7 @@ def render():
             title=f"AI Source Traffic Trend ({view})",
             markers=True,
         )
-        st.plotly_chart(fig_geo_trend, use_container_width=True)
+        st.plotly_chart(fig_geo_trend, width="stretch")
 
         geo_trend_text = "\n".join(
             f"  {r['session_source']}: {int(r['sessions']):,}"

@@ -1,10 +1,13 @@
 """Configuration and page category mapping."""
 
+import json
 import os
 
 from dotenv import load_dotenv
 
-load_dotenv()
+# Only load .env file for local dev — Railway injects env vars directly
+if not os.getenv("RAILWAY_ENVIRONMENT"):
+    load_dotenv()
 
 # URL path prefix → display name for page category grouping.
 # Used across GSC impressions, GA4 traffic, and GEO traffic breakdowns.
@@ -129,10 +132,13 @@ def get_google_credentials() -> dict | str | None:
     val = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
     if not val or val.startswith("path/to"):
         return None
+    val = val.strip()
     # If it looks like JSON, parse it
-    if val.strip().startswith("{"):
-        import json
-        return json.loads(val)
+    if val.startswith("{"):
+        try:
+            return json.loads(val)
+        except json.JSONDecodeError:
+            return None
     # Otherwise treat as file path
     if not os.path.exists(val):
         return None

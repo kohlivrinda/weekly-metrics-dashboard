@@ -10,7 +10,8 @@ from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 from dotenv import load_dotenv
 
-load_dotenv()
+if not os.getenv("RAILWAY_ENVIRONMENT"):
+    load_dotenv()
 
 _pool: ConnectionPool | None = None
 
@@ -21,7 +22,7 @@ def get_pool() -> ConnectionPool:
     """Return the module-level connection pool, creating it on first call."""
     global _pool
     if _pool is None:
-        dsn = os.environ.get("DATABASE_URL")
+        dsn = (os.environ.get("DATABASE_URL") or "").strip()
         if not dsn:
             raise RuntimeError("DATABASE_URL not set in .env")
         _pool = ConnectionPool(

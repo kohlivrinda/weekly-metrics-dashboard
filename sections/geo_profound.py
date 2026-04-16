@@ -27,11 +27,12 @@ PLATFORMS = ["ChatGPT", "Google AI Overviews", "Perplexity"]
 # ---------------------------------------------------------------------------
 
 
+@st.cache_data(ttl=300)
 def _load_profound_data_from_db() -> pd.DataFrame | None:
     """Load all Profound data from database."""
     df = query_df("""
         SELECT date, topic, prompt, platform, position, mentioned, mentions,
-               citations, response, run_id, platform_id, tags, region,
+               citations, run_id, platform_id, tags, region,
                persona, type, search_queries, normalized_mentions
         FROM profound ORDER BY date
     """)
@@ -251,10 +252,10 @@ def render():
         )
         fig.update_traces(textposition="outside")
         fig.update_layout(showlegend=False)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     with col_table:
-        st.dataframe(stats_df, hide_index=True, use_container_width=True)
+        st.dataframe(stats_df, hide_index=True, width="stretch")
 
     # --- Cross-platform overlap ---
     st.subheader("Cross-Platform Overlap")
@@ -311,13 +312,13 @@ def render():
                 title="Most Cited Owned Pages (Top 15)",
             )
             fig_cited.update_layout(yaxis={"categoryorder": "total ascending"})
-            st.plotly_chart(fig_cited, use_container_width=True)
+            st.plotly_chart(fig_cited, width="stretch")
 
         with col_table:
             st.dataframe(
                 url_counts[["Page", "Page Category", "Times Cited"]],
                 hide_index=True,
-                use_container_width=True,
+                width="stretch",
             )
 
         # Summary by page category
@@ -327,7 +328,7 @@ def render():
         ).reset_index().sort_values("total_citations", ascending=False)
         cat_cited.columns = ["Page Category", "Unique Pages", "Total Citations"]
         st.write("**Citations by page category:**")
-        st.dataframe(cat_cited, hide_index=True, use_container_width=True)
+        st.dataframe(cat_cited, hide_index=True, width="stretch")
 
     # ------------------------------------------------------------------
     # COMPETITOR MENTIONS — replaces old "Most Cited Pages" section
@@ -350,7 +351,7 @@ def render():
             title="Most Mentioned Competitors",
         )
         fig_comp.update_layout(yaxis={"categoryorder": "total ascending"})
-        st.plotly_chart(fig_comp, use_container_width=True)
+        st.plotly_chart(fig_comp, width="stretch")
 
         # Per-platform competitor breakdown
         comp_by_platform = []
@@ -373,7 +374,7 @@ def render():
         if comp_by_platform:
             st.write("**Top competitors by platform:**")
             st.dataframe(
-                pd.DataFrame(comp_by_platform), hide_index=True, use_container_width=True
+                pd.DataFrame(comp_by_platform), hide_index=True, width="stretch"
             )
 
     # Keep gap_prompts for LLM summary
@@ -463,7 +464,7 @@ def render():
                 )
             rows.append(entry)
 
-        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
 
         # Chart: contested prompts where any competitor mentions >= ours
         contested = h2h.copy()
@@ -507,7 +508,7 @@ def render():
                 xaxis_title="Mention Rate",
                 legend=dict(orientation="h", yanchor="bottom", y=1.02),
             )
-            st.plotly_chart(fig_h2h, use_container_width=True)
+            st.plotly_chart(fig_h2h, width="stretch")
         else:
             st.success(f"No contested prompts — {topic} leads on all tracked prompts!")
 
@@ -541,4 +542,4 @@ Top competitors:\n{comp_summary}"""
     )
     prompt_pivot = prompt_pivot.sort_values("Mentioned On", ascending=False)
 
-    st.dataframe(prompt_pivot, use_container_width=True)
+    st.dataframe(prompt_pivot, width="stretch")

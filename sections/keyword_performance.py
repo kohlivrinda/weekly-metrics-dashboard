@@ -280,6 +280,7 @@ def _expand_intents(intent_str: str) -> list[str]:
 # Render
 # ---------------------------------------------------------------------------
 
+@st.cache_data(ttl=300)
 def _load_keyword_data() -> tuple[pd.DataFrame, pd.DataFrame] | None:
     """Load keyword data from database."""
     daily_df = query_df(
@@ -435,7 +436,7 @@ def render():
     st.dataframe(
         snapshot_display,
         hide_index=True,
-        use_container_width=True,
+        width="stretch",
         column_config={
             "Rank": st.column_config.NumberColumn(format="%d"),
             "WoW Change": st.column_config.NumberColumn(
@@ -486,7 +487,7 @@ def render():
         )
         fig_trend.update_yaxes(autorange="reversed")
         fig_trend.update_layout(xaxis_tickformat="%b %d")
-        st.plotly_chart(fig_trend, use_container_width=True)
+        st.plotly_chart(fig_trend, width="stretch")
 
         kw_trend_text = "\n".join(
             f"  {kw}: rank {int(trend_df[trend_df['keyword']==kw]['rank'].iloc[-1])}"
@@ -531,7 +532,7 @@ def render():
             )
             fig_vol.update_layout(yaxis={"categoryorder": "total ascending"})
             fig_vol.update_traces(textposition="outside")
-            st.plotly_chart(fig_vol, use_container_width=True)
+            st.plotly_chart(fig_vol, width="stretch")
         else:
             st.success("All positions were stable this week.")
 
@@ -566,6 +567,6 @@ def render():
         st.dataframe(
             diff_rank[list(display_cols.keys())].rename(columns=display_cols),
             hide_index=True,
-            use_container_width=True,
+            width="stretch",
         )
 

@@ -21,9 +21,13 @@ def _enrich_gsc_df(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+@st.cache_data(ttl=300)
 def _load_all_gsc_data() -> pd.DataFrame | None:
-    """Load all GSC data from the database."""
-    df = query_df("SELECT date, page, query, clicks, impressions, ctr, position FROM gsc ORDER BY date")
+    """Load GSC data from the database (last 8 weeks max)."""
+    df = query_df(
+        "SELECT date, page, query, clicks, impressions, ctr, position "
+        "FROM gsc WHERE date >= CURRENT_DATE - INTERVAL '56 days' ORDER BY date"
+    )
     if df.empty:
         return None
     return _enrich_gsc_df(df)
@@ -144,7 +148,7 @@ def render():
         title=f"{view} Impressions",
         labels={"period_label": "Period", "impressions": "Impressions"},
     )
-    st.plotly_chart(fig_trend, use_container_width=True)
+    st.plotly_chart(fig_trend, width="stretch")
 
     trend_summary = "\n".join(f"  {r['period_label']}: {r['impressions']:,.0f}" for _, r in trend.iterrows())
     render_chart_insight("gsc_trend", trend_summary, "What's driving the week-over-week impressions trend?")
@@ -192,7 +196,7 @@ def render():
     st.dataframe(
         cat_latest[list(display_cols.keys())].rename(columns=display_cols),
         hide_index=True,
-        use_container_width=True,
+        width="stretch",
     )
 
     # --- Page category trend over time ---
@@ -210,4 +214,4 @@ def render():
         color="page_category",
         title=f"Impressions by Page Category ({view})",
     )
-    st.plotly_chart(fig_cat_trend, use_container_width=True)
+    st.plotly_chart(fig_cat_trend, width="stretch")
