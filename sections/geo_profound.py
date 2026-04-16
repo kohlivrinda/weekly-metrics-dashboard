@@ -512,15 +512,75 @@ def render():
         else:
             st.success(f"No contested prompts — {topic} leads on all tracked prompts!")
 
-    # Insight for head-to-head
+    # ------------------------------------------------------------------
+    # MISSED PROMPTS — competitors mentioned, we're not
+    # ------------------------------------------------------------------
+    st.subheader("Missed Prompts")
+    st.caption(
+        "Prompts where competitors are mentioned but we're absent — "
+        "the biggest opportunities for visibility."
+    )
+
+    # Find prompts where we're NOT mentioned but at least one competitor IS
+    missed = filtered[~filtered["is_mentioned"] & filtered["comp_mentioned"]].copy()
+
+    if missed.empty:
+        st.success("No missed prompts — we appear everywhere competitors do!")
+    else:
+        # Group by prompt: show which platforms we're missing on and which competitors appear
+        missed_summary = (
+            missed.groupby("prompt")
+            .agg(
+                platforms_missed=("platform", lambda x: ", ".join(sorted(x.unique()))),
+                competitors=("mentions", lambda x: ", ".join(
+                    sorted({
+                        name for mentions_str in x.dropna()
+                        for name in str(mentions_str).lower().split(",")
+                        if name.strip() in COMPETITOR_NAMES
+                    })
+                )),
+                times=("prompt", "size"),
+            )
+            .reset_index()
+            .sort_values("times", ascending=False)
+        )
+
+        # Add topic column
+        prompt_topics = filtered.groupby("prompt")["topic"].first()
+        missed_summary["topic"] = missed_summary["prompt"].map(prompt_topics)
+
+        st.dataframe(
+            missed_summary[["topic", "prompt", "platforms_missed", "competitors", "times"]].rename(
+                columns={
+                    "topic": "Topic",
+                    "prompt": "Prompt",
+                    "platforms_missed": "Platforms We're Missing On",
+                    "competitors": "Competitors Mentioned",
+                    "times": "Occurrences",
+                }
+            ),
+            hide_index=True,
+            width="stretch",
+        )
+
+        # Metric: how many prompts we're missing vs total
+        n_missed = missed_summary["prompt"].nunique()
+        st.metric(
+            "Prompts Where Competitors Appear Without Us",
+            f"{n_missed} / {total_prompts}",
+        )
+
+    # Insight for competitive landscape
     comp_summary = ""
     if not comp_names.empty:
         top3 = comp_names.value_counts().head(3)
         comp_summary = "\n".join(f"  {n}: {c}x" for n, c in top3.items())
+    missed_text = f"Missed prompts: {missed['prompt'].nunique() if not missed.empty else 0}" if not missed.empty else ""
     h2h_text = f"""Mention rate: {prompts_appeared}/{total_prompts} ({prompts_appeared/total_prompts*100:.0f}%)
 Per platform: {', '.join(f"{s['Platform']}: {s['Mentioned']}/{s['Total Prompts']}" for s in platform_stats)}
-Top competitors:\n{comp_summary}"""
-    render_chart_insight("h2h_competitors", h2h_text, "How are we performing vs competitors across AI platforms?")
+Top competitors:\n{comp_summary}
+{missed_text}"""
+    render_chart_insight("h2h_competitors", h2h_text, "Where are we losing to competitors and what should we prioritize?")
 
     # --- Prompt-level detail table ---
     st.subheader("Prompt Detail")
