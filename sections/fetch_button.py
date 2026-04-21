@@ -51,6 +51,7 @@ def render_fetch_button():
 
         st.session_state["fetch_done"] = True
         st.session_state["fetch_results"] = results
+        st.cache_data.clear()
         st.rerun()
 
     # Show persisted results after rerun

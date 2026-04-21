@@ -85,6 +85,8 @@ def fetch_gsc_data() -> tuple[int, bool]:
         latest_data_date,
         upsert_gsc,
         upsert_gsc_country,
+        upsert_gsc_page_daily,
+        upsert_gsc_site_daily,
         sync_gsc_keyword_rankings,
     )
 
@@ -96,6 +98,26 @@ def fetch_gsc_data() -> tuple[int, bool]:
     gsc_existed = gsc_latest is not None and gsc_latest >= end_date_obj
     country_latest = latest_data_date("gsc_country")
     country_existed = country_latest is not None and country_latest >= end_date_obj
+    page_daily_latest = latest_data_date("gsc_page_daily")
+    page_daily_existed = page_daily_latest is not None and page_daily_latest >= end_date_obj
+    site_daily_latest = latest_data_date("gsc_site_daily")
+    site_daily_existed = site_daily_latest is not None and site_daily_latest >= end_date_obj
+
+    # --- Site-level daily totals (date only, no page/query dim — matches GSC UI exactly) ---
+    if not site_daily_existed:
+        site_daily_rows = _fetch_gsc_dimensioned(
+            service, site_url, start_date, end_date,
+            dimensions=["date"],
+            mapper=lambda keys, row: {
+                "date": keys[0],
+                "clicks": row["clicks"],
+                "impressions": row["impressions"],
+                "ctr": row["ctr"],
+                "position": row["position"],
+            },
+        )
+        if site_daily_rows:
+            upsert_gsc_site_daily(site_daily_rows)
 
     # --- Country fetch (date × country aggregates) ---
     if not country_existed:
@@ -113,6 +135,26 @@ def fetch_gsc_data() -> tuple[int, bool]:
         )
         if country_rows:
             upsert_gsc_country(country_rows)
+
+    # --- Page-level daily aggregates (no query dimension → accurate totals).
+    #     GSC drops anonymized-query rows when `query` is a dimension, so the
+    #     (date, page, query) sum under-counts vs the GSC UI. This separate
+    #     fetch without the query dimension restores the true totals. ---
+    if not page_daily_existed:
+        page_daily_rows = _fetch_gsc_dimensioned(
+            service, site_url, start_date, end_date,
+            dimensions=["date", "page"],
+            mapper=lambda keys, row: {
+                "date": keys[0],
+                "page": keys[1],
+                "clicks": row["clicks"],
+                "impressions": row["impressions"],
+                "ctr": row["ctr"],
+                "position": row["position"],
+            },
+        )
+        if page_daily_rows:
+            upsert_gsc_page_daily(page_daily_rows)
 
     # --- Main fetch (date × page × query) ---
     if gsc_existed:
@@ -154,6 +196,7 @@ def _fetch_gsc_dimensioned(service, site_url, start_date, end_date, dimensions, 
             "startDate": start_date,
             "endDate": end_date,
             "dimensions": dimensions,
+            "type": "web",
             "rowLimit": page_size,
             "startRow": start_row,
         }

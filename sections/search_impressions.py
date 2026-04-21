@@ -1,11 +1,13 @@
 """Search Impressions — Google Search Console data via API."""
 
+from datetime import timedelta
+
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 
 from config import categorize_page, is_ga4_configured, is_gsc_configured
-from db import query_df, upsert_gsc
+from db import query_df, upsert_gsc, upsert_gsc_page_daily
 from llm import render_chart_insight
 from sections.fetch_button import render_fetch_button as _render_fetch_button
 
@@ -21,17 +23,50 @@ def _enrich_gsc_df(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-@st.cache_data(ttl=300, max_entries=1)
-def _load_all_gsc_data() -> pd.DataFrame | None:
-    """Load GSC data from the database (last 4 weeks).
+def _bucket(frame: pd.DataFrame, granularity: str) -> pd.DataFrame:
+    """Return a copy with `bucket` (timestamp) and `bucket_label` columns.
 
-    We intentionally drop `query`, `ctr`, `position` from the SELECT — they
-    aren't used by this section and `query` is the heaviest string column in
-    the gsc table.
+    Used only to change trend-chart x-axis granularity; summary metrics and
+    tables remain driven by the date range selection.
+    """
+    frame = frame.copy()
+    if granularity == "Weekly":
+        frame["bucket"] = frame["date"].dt.to_period("W-SAT").apply(lambda r: r.start_time)
+        frame["bucket_label"] = frame["bucket"].apply(
+            lambda d: f"{d.strftime('%b %d')} – {(d + pd.Timedelta(days=6)).strftime('%b %d')}"
+        )
+    elif granularity == "Monthly":
+        frame["bucket"] = frame["date"].dt.to_period("M").apply(lambda r: r.start_time)
+        frame["bucket_label"] = frame["bucket"].dt.strftime("%b %Y")
+    else:  # Daily
+        frame["bucket"] = frame["date"].dt.normalize()
+        frame["bucket_label"] = frame["bucket"].dt.strftime("%b %d")
+    return frame
+
+
+@st.cache_data(ttl=300, max_entries=1)
+def _load_gsc_site_daily() -> pd.DataFrame | None:
+    """Load site-level GSC totals (date only, no page dimension).
+
+    Matches GSC UI headline numbers exactly — avoids multi-URL-per-query
+    impression inflation that occurs when summing page-level rows.
     """
     df = query_df(
+        "SELECT date, clicks, impressions "
+        "FROM gsc_site_daily WHERE date >= CURRENT_DATE - INTERVAL '56 days' ORDER BY date"
+    )
+    if df.empty:
+        return None
+    df["date"] = pd.to_datetime(df["date"])
+    return df
+
+
+@st.cache_data(ttl=300, max_entries=1)
+def _load_all_gsc_data() -> pd.DataFrame | None:
+    """Load page-level GSC aggregates (last 8 weeks) for breakdown charts/tables."""
+    df = query_df(
         "SELECT date, page, clicks, impressions "
-        "FROM gsc WHERE date >= CURRENT_DATE - INTERVAL '28 days' ORDER BY date"
+        "FROM gsc_page_daily WHERE date >= CURRENT_DATE - INTERVAL '56 days' ORDER BY date"
     )
     if df.empty:
         return None
@@ -62,9 +97,12 @@ def render():
         )
 
     # --- Load data from DB or CSV upload fallback ---
+    # site_df: date-level totals for headline metrics (matches GSC UI)
+    # df: page-level data for breakdowns and trend charts
+    site_df = _load_gsc_site_daily()
     df = _load_all_gsc_data()
 
-    if df is None:
+    if site_df is None and df is None:
         uploaded = st.file_uploader(
             "Or upload a GSC CSV",
             type=["csv"],
@@ -79,62 +117,75 @@ def render():
                 st.error(f"Missing columns: {missing}")
                 return
             upsert_gsc(raw[EXPECTED_COLUMNS].to_dict("records"))
+            # CSV exports with a `query` dimension still under-count anonymized
+            # queries — but this keeps the upload path working until the user
+            # re-fetches via the API. Aggregate best-effort to (date, page).
+            page_agg = (
+                raw.groupby(["date", "page"], as_index=False)
+                .agg(clicks=("clicks", "sum"), impressions=("impressions", "sum"))
+            )
+            page_agg["ctr"] = page_agg["clicks"] / page_agg["impressions"].replace(0, 1)
+            page_agg["position"] = 0.0
+            upsert_gsc_page_daily(page_agg.to_dict("records"))
             st.success(f"Inserted {len(raw):,} rows.")
             st.rerun()
         return
 
-    if df is None:
-        return
-
     # --- Date range filter ---
-    dates = sorted(df["date"].dt.date.unique())
+    # Default: the most recent complete Sun–Sat week that exists in the data.
+    # Prior period (for % deltas) = a same-length window immediately before.
+    ref_df = site_df if site_df is not None else df
+    dates = sorted(ref_df["date"].dt.date.unique())
+    try:
+        from google_api import latest_complete_week
+        default_start, default_end = latest_complete_week()
+    except Exception:
+        default_end = max(dates)
+        default_start = default_end - timedelta(days=6)
+    default_start = max(default_start, min(dates))
+    default_end = min(default_end, max(dates))
     date_range = st.date_input(
         "Date range",
-        value=(min(dates), max(dates)),
+        value=(default_start, default_end),
         min_value=min(dates),
         max_value=max(dates),
         key="gsc_dates",
     )
 
-    if isinstance(date_range, tuple) and len(date_range) == 2:
-        df = df[(df["date"].dt.date >= date_range[0]) & (df["date"].dt.date <= date_range[1])]
+    if not (isinstance(date_range, tuple) and len(date_range) == 2):
+        st.info("Pick a start and end date.")
+        return
 
-    # --- View toggle ---
-    view = st.radio("View", ["Weekly", "Monthly"], horizontal=True, key="gsc_view")
+    curr_start, curr_end = date_range
+    period_days = (curr_end - curr_start).days + 1
+    prev_end = curr_start - timedelta(days=1)
+    prev_start = prev_end - timedelta(days=period_days - 1)
 
-    if view == "Weekly":
-        # "W-SAT" = week ending Saturday → start_time is the Sunday.
-        df["period"] = df["date"].dt.to_period("W-SAT").apply(lambda r: r.start_time)
-    else:
-        df["period"] = df["date"].dt.to_period("M").apply(lambda r: r.start_time)
-
-    # --- Period comparison setup ---
-    periods = sorted(df["period"].unique())
-    latest_period = periods[-1]
-    prev_period = periods[-2] if len(periods) >= 2 else None
-
-    df_latest = df[df["period"] == latest_period]
-    df_prev = df[df["period"] == prev_period] if prev_period is not None else None
-
-    # --- Top-level metrics (latest period with delta) ---
-    period_label = "Week" if view == "Weekly" else "Month"
-    if view == "Weekly":
-        period_range_label = (
-            f"{latest_period.strftime('%b %d')} – "
-            f"{(latest_period + pd.Timedelta(days=6)).strftime('%b %d, %Y')}"
-        )
-    else:
-        period_range_label = latest_period.strftime("%b %Y")
+    period_range_label = f"{curr_start.strftime('%b %d')} – {curr_end.strftime('%b %d, %Y')}"
     st.subheader(f"Period Summary ({period_range_label})")
 
-    latest_impressions = df_latest["impressions"].sum()
-    latest_clicks = df_latest["clicks"].sum()
+    # Headline metrics from site-level totals (matches GSC UI)
+    if site_df is not None:
+        site_latest = site_df[(site_df["date"].dt.date >= curr_start) & (site_df["date"].dt.date <= curr_end)]
+        site_prev_raw = site_df[(site_df["date"].dt.date >= prev_start) & (site_df["date"].dt.date <= prev_end)]
+        site_prev = site_prev_raw if not site_prev_raw.empty else None
+        latest_impressions = site_latest["impressions"].sum()
+        latest_clicks = site_latest["clicks"].sum()
+    elif df is not None:
+        df_latest_tmp = df[(df["date"].dt.date >= curr_start) & (df["date"].dt.date <= curr_end)]
+        site_prev = None
+        latest_impressions = df_latest_tmp["impressions"].sum()
+        latest_clicks = df_latest_tmp["clicks"].sum()
+    else:
+        latest_impressions = latest_clicks = 0
+        site_prev = None
+
     latest_ctr = latest_clicks / latest_impressions * 100 if latest_impressions else 0
 
     imp_delta = click_delta = ctr_delta = None
-    if df_prev is not None:
-        prev_impressions = df_prev["impressions"].sum()
-        prev_clicks = df_prev["clicks"].sum()
+    if site_prev is not None:
+        prev_impressions = site_prev["impressions"].sum()
+        prev_clicks = site_prev["clicks"].sum()
         prev_ctr = prev_clicks / prev_impressions * 100 if prev_impressions else 0
         if prev_impressions:
             imp_delta = f"{(latest_impressions - prev_impressions) / prev_impressions * 100:+.0f}%"
@@ -142,13 +193,21 @@ def render():
             click_delta = f"{(latest_clicks - prev_clicks) / prev_clicks * 100:+.0f}%"
         ctr_delta = f"{latest_ctr - prev_ctr:+.1f}pp"
 
-    # Pages appearing in search (proxy for indexed pages)
-    pages_in_search = df_latest["page"].nunique()
+    # Pages in search from page-level data (site_daily has no page column)
+    pages_in_search = 0
     pages_delta = None
-    if df_prev is not None:
-        prev_pages = df_prev["page"].nunique()
-        if prev_pages:
-            pages_delta = f"{pages_in_search - prev_pages:+d}"
+    if df is not None:
+        df_latest = df[(df["date"].dt.date >= curr_start) & (df["date"].dt.date <= curr_end)]
+        df_prev_raw = df[(df["date"].dt.date >= prev_start) & (df["date"].dt.date <= prev_end)]
+        df_prev = df_prev_raw if not df_prev_raw.empty else None
+        pages_in_search = df_latest["page"].nunique()
+        if df_prev is not None:
+            prev_pages = df_prev["page"].nunique()
+            if prev_pages:
+                pages_delta = f"{pages_in_search - prev_pages:+d}"
+    else:
+        df_latest = pd.DataFrame()
+        df_prev = None
 
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Impressions", f"{latest_impressions:,.0f}", delta=imp_delta)
@@ -156,32 +215,40 @@ def render():
     m3.metric("CTR", f"{latest_ctr:.1f}%", delta=ctr_delta)
     m4.metric("Pages in Search", f"{pages_in_search:,}", delta=pages_delta)
 
-    # --- Impressions over time ---
-    st.subheader(f"Impressions Trend ({view})")
+    if df_latest.empty:
+        return
 
-    trend = df.groupby("period").agg(
-        impressions=("impressions", "sum"),
-        clicks=("clicks", "sum"),
-    ).reset_index()
-    if view == "Weekly":
-        trend["period_label"] = trend["period"].apply(
-            lambda d: f"{d.strftime('%b %d')} – {(d + pd.Timedelta(days=6)).strftime('%b %d')}"
-        )
-    else:
-        trend["period_label"] = trend["period"].dt.strftime("%b %Y")
+    # --- Impressions over time ---
+    st.subheader("Impressions Trend")
+
+    granularity = st.radio(
+        "Trend granularity",
+        ["Daily", "Weekly", "Monthly"],
+        horizontal=True,
+        key="gsc_granularity",
+        help="Changes trend-chart x-axis only. Summary metrics and tables above are driven by the date range.",
+    )
+    df_latest_b = _bucket(df_latest, granularity)
+
+    trend = (
+        df_latest_b.groupby(["bucket", "bucket_label"], observed=True)
+        .agg(impressions=("impressions", "sum"), clicks=("clicks", "sum"))
+        .reset_index()
+        .sort_values("bucket")
+    )
 
     fig_trend = px.bar(
         trend,
-        x="period_label",
+        x="bucket_label",
         y="impressions",
-        title=f"{view} Impressions",
-        labels={"period_label": "Period", "impressions": "Impressions"},
+        title=f"{granularity} Impressions",
+        labels={"bucket_label": granularity.rstrip("ly") or "Date", "impressions": "Impressions"},
     )
     fig_trend.update_xaxes(type="category")
     st.plotly_chart(fig_trend, width="stretch")
 
-    trend_summary = "\n".join(f"  {r['period_label']}: {r['impressions']:,.0f}" for _, r in trend.iterrows())
-    render_chart_insight("gsc_trend", trend_summary, "What's driving the week-over-week impressions trend?")
+    trend_summary = "\n".join(f"  {r['bucket_label']}: {r['impressions']:,.0f}" for _, r in trend.iterrows())
+    render_chart_insight("gsc_trend", trend_summary, "What's driving the impressions trend over this period?")
 
     # --- Page category breakdown (latest period with change vs previous) ---
     st.subheader(f"Impressions by Page Category ({period_range_label})")
@@ -230,28 +297,23 @@ def render():
     )
 
     # --- Page category trend over time ---
-    st.subheader(f"Page Category Trend ({view})")
+    st.subheader("Page Category Trend")
 
     cat_trend = (
-        df.groupby(["period", "page_category"])["impressions"]
+        df_latest_b.groupby(["bucket", "bucket_label", "page_category"], observed=True)["impressions"]
         .sum()
         .reset_index()
+        .sort_values("bucket")
     )
-    if view == "Weekly":
-        cat_trend["period_label"] = cat_trend["period"].apply(
-            lambda d: f"{d.strftime('%b %d')} – {(d + pd.Timedelta(days=6)).strftime('%b %d')}"
-        )
-    else:
-        cat_trend["period_label"] = cat_trend["period"].dt.strftime("%b %Y")
 
     fig_cat_trend = px.bar(
         cat_trend,
-        x="period_label",
+        x="bucket_label",
         y="impressions",
         color="page_category",
         barmode="group",
-        title=f"Impressions by Page Category ({view})",
-        labels={"period_label": "Period", "impressions": "Impressions"},
+        title=f"Impressions by Page Category ({granularity})",
+        labels={"bucket_label": granularity.rstrip("ly") or "Date", "impressions": "Impressions"},
     )
     fig_cat_trend.update_xaxes(type="category")
     st.plotly_chart(fig_cat_trend, width="stretch")
@@ -271,18 +333,15 @@ def render():
         )
     else:
         country_df["date"] = pd.to_datetime(country_df["date"])
-        if isinstance(date_range, tuple) and len(date_range) == 2:
-            country_df = country_df[
-                (country_df["date"].dt.date >= date_range[0])
-                & (country_df["date"].dt.date <= date_range[1])
-            ]
-        if view == "Weekly":
-            country_df["period"] = country_df["date"].dt.to_period("W-SAT").apply(lambda r: r.start_time)
-        else:
-            country_df["period"] = country_df["date"].dt.to_period("M").apply(lambda r: r.start_time)
-
-        c_latest = country_df[country_df["period"] == latest_period]
-        c_prev = country_df[country_df["period"] == prev_period] if prev_period is not None else None
+        c_latest = country_df[
+            (country_df["date"].dt.date >= curr_start)
+            & (country_df["date"].dt.date <= curr_end)
+        ]
+        c_prev_raw = country_df[
+            (country_df["date"].dt.date >= prev_start)
+            & (country_df["date"].dt.date <= prev_end)
+        ]
+        c_prev = c_prev_raw if not c_prev_raw.empty else None
 
         country_stats = (
             c_latest.groupby("country")

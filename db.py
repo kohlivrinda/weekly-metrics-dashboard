@@ -87,6 +87,42 @@ def upsert_gsc(rows: list[dict]):
     )
 
 
+def upsert_gsc_page_daily(rows: list[dict]):
+    """Upsert page-level GSC aggregates (no query dimension)."""
+    if not rows:
+        return
+    _batch_execute(
+        """
+        INSERT INTO gsc_page_daily (date, page, clicks, impressions, ctr, position)
+        VALUES (%(date)s, %(page)s, %(clicks)s, %(impressions)s, %(ctr)s, %(position)s)
+        ON CONFLICT (date, md5(page)) DO UPDATE SET
+            clicks = EXCLUDED.clicks,
+            impressions = EXCLUDED.impressions,
+            ctr = EXCLUDED.ctr,
+            position = EXCLUDED.position
+        """,
+        rows,
+    )
+
+
+def upsert_gsc_site_daily(rows: list[dict]):
+    """Upsert date-level GSC site totals (no page/query dimension — matches GSC UI)."""
+    if not rows:
+        return
+    _batch_execute(
+        """
+        INSERT INTO gsc_site_daily (date, clicks, impressions, ctr, position)
+        VALUES (%(date)s, %(clicks)s, %(impressions)s, %(ctr)s, %(position)s)
+        ON CONFLICT (date) DO UPDATE SET
+            clicks = EXCLUDED.clicks,
+            impressions = EXCLUDED.impressions,
+            ctr = EXCLUDED.ctr,
+            position = EXCLUDED.position
+        """,
+        rows,
+    )
+
+
 def upsert_gsc_country(rows: list[dict]):
     """Upsert GSC country-level aggregates."""
     if not rows:
