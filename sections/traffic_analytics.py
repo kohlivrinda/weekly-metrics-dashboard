@@ -196,11 +196,22 @@ def render():
         df_src_latest = df_latest
         df_src_prev = df_prev
 
+    # Filter source-level frames to sources that drove non-/jobs traffic.
+    # ga4 (page-level) already excludes /jobs pages, so its source set is the
+    # authoritative list. Sources that only drove /jobs traffic are dropped from
+    # breakdowns but NOT from the session total (which stays accurate vs GA4 UI).
+    non_jobs_sources = set(df_latest["session_source"].astype(str).unique())
+    df_src_display = df_src_latest[df_src_latest["session_source"].astype(str).isin(non_jobs_sources)]
+    df_src_prev_display = (
+        df_src_prev[df_src_prev["session_source"].astype(str).isin(non_jobs_sources)]
+        if df_src_prev is not None else None
+    )
+
     period_range_label = f"{curr_start.strftime('%b %d')} – {curr_end.strftime('%b %d, %Y')}"
 
     # --- Overview (latest period with delta) ---
     st.subheader(f"Period Summary ({period_range_label})")
-    latest_sessions = df_src_latest["sessions"].sum()
+    latest_sessions = df_src_latest["sessions"].sum()  # unfiltered — matches GA4 UI
 
     session_delta = None
     if df_src_prev is not None:
@@ -210,23 +221,23 @@ def render():
 
     m1, m2 = st.columns(2)
     m1.metric("Total Sessions", f"{latest_sessions:,.0f}", delta=session_delta)
-    m2.metric("Unique Sources", df_src_latest["session_source"].nunique())
+    m2.metric("Unique Sources", df_src_display["session_source"].nunique())
 
     # --- Traffic by Medium ---
     st.subheader(f"Traffic by Medium ({period_range_label})")
 
     medium_col = "session_medium"
-    if medium_col in df_src_latest.columns:
+    if medium_col in df_src_display.columns:
         med_latest = (
-            df_src_latest.groupby(medium_col)["sessions"]
+            df_src_display.groupby(medium_col)["sessions"]
             .sum()
             .reset_index()
             .sort_values("sessions", ascending=False)
         )
 
-        if df_src_prev is not None:
+        if df_src_prev_display is not None:
             med_prev = (
-                df_src_prev.groupby(medium_col)["sessions"]
+                df_src_prev_display.groupby(medium_col)["sessions"]
                 .sum()
                 .reset_index()
                 .rename(columns={"sessions": "sessions_prev"})
@@ -239,7 +250,7 @@ def render():
             )
 
         med_display = {medium_col: "Medium", "sessions": "Sessions"}
-        if df_src_prev is not None:
+        if df_src_prev_display is not None:
             med_display["change"] = "Change"
         st.dataframe(
             med_latest[list(med_display.keys())].rename(columns=med_display),
@@ -251,15 +262,15 @@ def render():
     st.subheader(f"Sessions by Source ({period_range_label})")
 
     source_latest = (
-        df_src_latest.groupby("session_source", observed=True)["sessions"]
+        df_src_display.groupby("session_source", observed=True)["sessions"]
         .sum()
         .reset_index()
         .sort_values("sessions", ascending=False)
     )
 
-    if df_src_prev is not None:
+    if df_src_prev_display is not None:
         source_prev = (
-            df_src_prev.groupby("session_source", observed=True)["sessions"]
+            df_src_prev_display.groupby("session_source", observed=True)["sessions"]
             .sum()
             .reset_index()
             .rename(columns={"sessions": "sessions_prev"})
@@ -272,7 +283,7 @@ def render():
         )
 
     src_display = {"session_source": "Source", "sessions": "Sessions"}
-    if df_src_prev is not None:
+    if df_src_prev_display is not None:
         src_display["change"] = "Change"
     st.dataframe(
         source_latest.head(30)[list(src_display.keys())].rename(columns=src_display),
@@ -292,10 +303,7 @@ def render():
     )
 
     top_sources = source_latest.head(8)["session_source"].tolist()
-    trend_df = _bucket(
-        (df_src_latest if df_src is not None else df_latest),
-        granularity,
-    )
+    trend_df = _bucket(df_src_display, granularity)
     source_trend = (
         trend_df[trend_df["session_source"].isin(top_sources)]
         .groupby(["bucket", "bucket_label", "session_source"], observed=True)["sessions"]

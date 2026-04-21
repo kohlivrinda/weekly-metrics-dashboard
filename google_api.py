@@ -15,6 +15,22 @@ from google.analytics.data_v1beta.types import (
     RunReportRequest,
 )
 
+def _not_jobs_filter() -> FilterExpression:
+    """Exclude pages whose path contains /jobs (careers traffic, not marketing)."""
+    return FilterExpression(
+        not_expression=FilterExpression(
+            filter=Filter(
+                field_name="pagePath",
+                string_filter=Filter.StringFilter(
+                    match_type=Filter.StringFilter.MatchType.CONTAINS,
+                    value="/jobs",
+                    case_sensitive=False,
+                ),
+            )
+        )
+    )
+
+
 TRACKED_EVENT_NAMES = [
     "bifrost_homepage_enterprise_form_submit",
     "bifrost_demo_form_submit",
@@ -238,6 +254,8 @@ def fetch_ga4_data() -> tuple[int, bool]:
     credentials = _get_credentials(GA4_SCOPES)
     client = BetaAnalyticsDataClient(credentials=credentials)
 
+    not_jobs = _not_jobs_filter()
+
     # --- Source+medium-level traffic with user counts ---
     traffic_latest = latest_data_date("ga4_traffic")
     if traffic_latest is None or traffic_latest < end_date_obj:
@@ -261,12 +279,17 @@ def fetch_ga4_data() -> tuple[int, bool]:
     events_latest = latest_data_date("ga4_events")
     if events_latest is None or events_latest < end_date_obj:
         event_filter = FilterExpression(
-            or_group=FilterExpressionList(expressions=[
-                FilterExpression(filter=Filter(
-                    field_name="eventName",
-                    string_filter=Filter.StringFilter(value=name),
-                ))
-                for name in TRACKED_EVENT_NAMES
+            and_group=FilterExpressionList(expressions=[
+                FilterExpression(
+                    or_group=FilterExpressionList(expressions=[
+                        FilterExpression(filter=Filter(
+                            field_name="eventName",
+                            string_filter=Filter.StringFilter(value=name),
+                        ))
+                        for name in TRACKED_EVENT_NAMES
+                    ])
+                ),
+                not_jobs,
             ])
         )
         event_rows = _fetch_ga4_report(
@@ -293,6 +316,7 @@ def fetch_ga4_data() -> tuple[int, bool]:
         client, property_id, start_date, end_date,
         dimensions=["date", "pagePath", "sessionSource", "sessionMedium"],
         metrics=["sessions"],
+        dimension_filter=not_jobs,
         mapper=lambda dims, metrics: {
             "date": _ga4_date(dims[0]),
             "page_path": dims[1],
