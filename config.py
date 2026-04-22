@@ -15,6 +15,7 @@ PAGE_CATEGORIES = {
     "/compare": "Comparison Pages",
     "/docs": "Docs",
     "/products": "Products",
+    "/bifrost/llm-cost-calculator": "LLM Cost Calculator",  # must precede /bifrost
     "/bifrost": "Bifrost",
     "/llm-cost-calculator": "LLM Cost Calculator",
     "/provider-status": "Provider Status",
@@ -26,7 +27,7 @@ PAGE_CATEGORIES = {
 
 # These are matched separately since they don't follow the path-prefix pattern.
 SPECIAL_PAGES = {
-    "/": "Bifrost Homepage",
+    "/": "Maxim Homepage",
     "/enterprise": "Bifrost Enterprise",
 }
 

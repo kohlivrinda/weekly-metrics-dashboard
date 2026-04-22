@@ -147,10 +147,19 @@ def upsert_ga4(rows: list[dict]):
         return
     _batch_execute(
         """
-        INSERT INTO ga4 (date, page_path, session_source, session_medium, sessions)
-        VALUES (%(date)s, %(page_path)s, %(session_source)s, %(session_medium)s, %(sessions)s)
+        INSERT INTO ga4 (date, page_path, session_source, session_medium,
+                         sessions, engaged_sessions, engagement_duration_s, new_users,
+                         exits, conversions)
+        VALUES (%(date)s, %(page_path)s, %(session_source)s, %(session_medium)s,
+                %(sessions)s, %(engaged_sessions)s, %(engagement_duration_s)s, %(new_users)s,
+                %(exits)s, %(conversions)s)
         ON CONFLICT (date, page_path, session_source, session_medium) DO UPDATE SET
-            sessions = EXCLUDED.sessions
+            sessions              = EXCLUDED.sessions,
+            engaged_sessions      = EXCLUDED.engaged_sessions,
+            engagement_duration_s = EXCLUDED.engagement_duration_s,
+            new_users             = EXCLUDED.new_users,
+            exits                 = EXCLUDED.exits,
+            conversions           = EXCLUDED.conversions
         """,
         rows,
     )
@@ -163,14 +172,19 @@ def upsert_ga4_traffic(rows: list[dict]):
     _batch_execute(
         """
         INSERT INTO ga4_traffic
-            (date, session_source, session_medium, sessions, total_users, active_users)
+            (date, session_source, session_medium, sessions, total_users, active_users,
+             engaged_sessions, new_users, engagement_duration_s)
         VALUES
             (%(date)s, %(session_source)s, %(session_medium)s,
-             %(sessions)s, %(total_users)s, %(active_users)s)
+             %(sessions)s, %(total_users)s, %(active_users)s,
+             %(engaged_sessions)s, %(new_users)s, %(engagement_duration_s)s)
         ON CONFLICT (date, session_source, session_medium) DO UPDATE SET
-            sessions = EXCLUDED.sessions,
-            total_users = EXCLUDED.total_users,
-            active_users = EXCLUDED.active_users
+            sessions              = EXCLUDED.sessions,
+            total_users           = EXCLUDED.total_users,
+            active_users          = EXCLUDED.active_users,
+            engaged_sessions      = EXCLUDED.engaged_sessions,
+            new_users             = EXCLUDED.new_users,
+            engagement_duration_s = EXCLUDED.engagement_duration_s
         """,
         rows,
     )
@@ -187,6 +201,45 @@ def upsert_ga4_events(rows: list[dict]):
         VALUES
             (%(date)s, %(event_name)s, %(session_primary_channel_group)s, %(event_count)s)
         ON CONFLICT (date, event_name, session_primary_channel_group) DO UPDATE SET
+            event_count = EXCLUDED.event_count
+        """,
+        rows,
+    )
+
+
+def upsert_ga4_landing_pages(rows: list[dict]):
+    """Upsert GA4 landing page rows."""
+    if not rows:
+        return
+    _batch_execute(
+        """
+        INSERT INTO ga4_landing_pages
+            (date, landing_page, session_source, session_medium,
+             sessions, engaged_sessions, new_users, engagement_duration_s, conversions)
+        VALUES
+            (%(date)s, %(landing_page)s, %(session_source)s, %(session_medium)s,
+             %(sessions)s, %(engaged_sessions)s, %(new_users)s, %(engagement_duration_s)s,
+             %(conversions)s)
+        ON CONFLICT (date, landing_page, session_source, session_medium) DO UPDATE SET
+            sessions              = EXCLUDED.sessions,
+            engaged_sessions      = EXCLUDED.engaged_sessions,
+            new_users             = EXCLUDED.new_users,
+            engagement_duration_s = EXCLUDED.engagement_duration_s,
+            conversions           = EXCLUDED.conversions
+        """,
+        rows,
+    )
+
+
+def upsert_ga4_page_events(rows: list[dict]):
+    """Upsert GA4 page-level event counts (scroll depth, etc.)."""
+    if not rows:
+        return
+    _batch_execute(
+        """
+        INSERT INTO ga4_page_events (date, page_path, event_name, event_count)
+        VALUES (%(date)s, %(page_path)s, %(event_name)s, %(event_count)s)
+        ON CONFLICT (date, page_path, event_name) DO UPDATE SET
             event_count = EXCLUDED.event_count
         """,
         rows,

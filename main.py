@@ -55,6 +55,8 @@ if stale:
 SECTIONS = {
     "Search Impressions (GSC)": "search_impressions",
     "Traffic Analytics (GA4)": "traffic_analytics",
+    "Content Analytics (GA4)": "content_analytics",
+    "Growth Diagnostics": "diagnostics",
     "Keyword Performance": "keyword_performance",
     "GEO Performance (Profound)": "geo_profound",
 }
@@ -65,6 +67,10 @@ if selected == "Search Impressions (GSC)":
     from sections.search_impressions import render
 elif selected == "Traffic Analytics (GA4)":
     from sections.traffic_analytics import render
+elif selected == "Content Analytics (GA4)":
+    from sections.content_analytics import render
+elif selected == "Growth Diagnostics":
+    from sections.diagnostics import render
 elif selected == "Keyword Performance":
     from sections.keyword_performance import render
 elif selected == "GEO Performance (Profound)":

@@ -85,6 +85,22 @@ def _load_ga4_traffic() -> pd.DataFrame | None:
 
 
 @st.cache_data(ttl=300, max_entries=1)
+def _load_ga4_landing_pages() -> pd.DataFrame | None:
+    """Entry-point sessions by landing page + source."""
+    df = query_df(
+        "SELECT date, landing_page, session_source, session_medium, sessions "
+        "FROM ga4_landing_pages WHERE date >= CURRENT_DATE - INTERVAL '56 days' ORDER BY date"
+    )
+    if df.empty:
+        return None
+    df["date"] = pd.to_datetime(df["date"])
+    df["sessions"] = pd.to_numeric(df["sessions"], errors="coerce").fillna(0).astype(int)
+    df["page_category"] = df["landing_page"].apply(categorize_page).astype("category")
+    df["session_source"] = df["session_source"].astype("category")
+    return df
+
+
+@st.cache_data(ttl=300, max_entries=1)
 def _load_ga4_events() -> pd.DataFrame | None:
     """Tracked event counts by channel group."""
     df = query_df(
@@ -120,6 +136,7 @@ def render():
     #             Accurate session counts that match the GA4 UI.
     df = _load_all_ga4_data()
     df_src = _load_ga4_traffic()
+    df_lp = _load_ga4_landing_pages()
 
     if df is None:
         uploaded = st.file_uploader(
@@ -137,7 +154,13 @@ def render():
                 return
             if "session_medium" not in raw.columns:
                 raw["session_medium"] = ""
-            upsert_ga4(raw[["date", "page_path", "session_source", "session_medium", "sessions"]].to_dict("records"))
+            rows = raw[["date", "page_path", "session_source", "session_medium", "sessions"]].copy()
+            rows["engaged_sessions"] = 0
+            rows["engagement_duration_s"] = 0
+            rows["new_users"] = 0
+            rows["exits"] = 0
+            rows["conversions"] = 0
+            upsert_ga4(rows.to_dict("records"))
             st.success(f"Inserted {len(raw):,} rows.")
             st.rerun()
         return
@@ -374,6 +397,7 @@ def render():
 
     # --- Per-source landing page drill-down ---
     st.subheader("Landing Page Breakdown by Source")
+    st.caption("Entry-point sessions only (first page of the session) — totals match the Sessions by Source table above.")
 
     available_sources = source_latest["session_source"].tolist()
     drill_source = st.selectbox(
@@ -382,13 +406,23 @@ def render():
         key="drill_source",
     )
 
-    drill_df = (
-        df_latest[df_latest["session_source"] == drill_source]
-        .groupby("page_category")["sessions"]
-        .sum()
-        .reset_index()
-        .sort_values("sessions", ascending=False)
-    )
+    if df_lp is not None:
+        lp_latest = _slice(df_lp, curr_start, curr_end)
+        drill_df = (
+            lp_latest[lp_latest["session_source"].astype(str) == drill_source]
+            .groupby("page_category", observed=True)["sessions"]
+            .sum()
+            .reset_index()
+            .sort_values("sessions", ascending=False)
+        )
+    else:
+        drill_df = (
+            df_latest[df_latest["session_source"].astype(str) == drill_source]
+            .groupby("page_category", observed=True)["sessions"]
+            .sum()
+            .reset_index()
+            .sort_values("sessions", ascending=False)
+        )
 
     fig_drill = px.bar(
         drill_df,

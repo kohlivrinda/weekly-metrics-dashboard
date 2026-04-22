@@ -225,6 +225,8 @@ def fetch_ga4_data(start_date: str, end_date: str) -> int:
         upsert_ga4,
         upsert_ga4_traffic,
         upsert_ga4_events,
+        upsert_ga4_landing_pages,
+        upsert_ga4_page_events,
     )
 
     credentials = _get_credentials(GA4_SCOPES)
@@ -232,11 +234,12 @@ def fetch_ga4_data(start_date: str, end_date: str) -> int:
 
     not_jobs = _not_jobs_filter()
 
-    # --- Source+medium-level traffic with user counts ---
+    # --- Source+medium-level traffic with user counts + engagement ---
     traffic_rows = _fetch_ga4_report(
         client, property_id, start_date, end_date,
         dimensions=["date", "sessionSource", "sessionMedium"],
-        metrics=["sessions", "totalUsers", "activeUsers"],
+        metrics=["sessions", "totalUsers", "activeUsers",
+                 "engagedSessions", "newUsers", "userEngagementDuration"],
         mapper=lambda dims, metrics: {
             "date": _ga4_date(dims[0]),
             "session_source": dims[1],
@@ -244,6 +247,9 @@ def fetch_ga4_data(start_date: str, end_date: str) -> int:
             "sessions": int(metrics[0]),
             "total_users": int(metrics[1]),
             "active_users": int(metrics[2]),
+            "engaged_sessions": int(metrics[3]),
+            "new_users": int(metrics[4]),
+            "engagement_duration_s": int(float(metrics[5])),
         },
     )
     if traffic_rows:
@@ -279,11 +285,12 @@ def fetch_ga4_data(start_date: str, end_date: str) -> int:
     if event_rows:
         upsert_ga4_events(event_rows)
 
-    # --- Main page-level sessions fetch ---
+    # --- Main page-level sessions fetch with engagement metrics ---
     all_rows = _fetch_ga4_report(
         client, property_id, start_date, end_date,
         dimensions=["date", "pagePath", "sessionSource", "sessionMedium"],
-        metrics=["sessions"],
+        metrics=["sessions", "engagedSessions", "userEngagementDuration", "newUsers",
+                 "conversions"],
         dimension_filter=not_jobs,
         mapper=lambda dims, metrics: {
             "date": _ga4_date(dims[0]),
@@ -291,6 +298,11 @@ def fetch_ga4_data(start_date: str, end_date: str) -> int:
             "session_source": dims[2],
             "session_medium": dims[3],
             "sessions": int(metrics[0]),
+            "engaged_sessions": int(metrics[1]),
+            "engagement_duration_s": int(float(metrics[2])),
+            "new_users": int(metrics[3]),
+            "exits": 0,
+            "conversions": int(float(metrics[4])),
         },
     )
 
@@ -301,6 +313,62 @@ def fetch_ga4_data(start_date: str, end_date: str) -> int:
         )
 
     upsert_ga4(all_rows)
+
+    # --- Landing page entry-point sessions ---
+    landing_rows = _fetch_ga4_report(
+        client, property_id, start_date, end_date,
+        dimensions=["date", "landingPage", "sessionSource", "sessionMedium"],
+        metrics=["sessions", "engagedSessions", "newUsers", "userEngagementDuration",
+                 "conversions"],
+        dimension_filter=not_jobs,
+        mapper=lambda dims, metrics: {
+            "date": _ga4_date(dims[0]),
+            "landing_page": dims[1],
+            "session_source": dims[2],
+            "session_medium": dims[3],
+            "sessions": int(metrics[0]),
+            "engaged_sessions": int(metrics[1]),
+            "new_users": int(metrics[2]),
+            "engagement_duration_s": int(float(metrics[3])),
+            "conversions": int(float(metrics[4])),
+        },
+    )
+    if landing_rows:
+        upsert_ga4_landing_pages(landing_rows)
+
+    # --- Page-level events: page_view + scroll (for scroll depth analysis) ---
+    page_event_filter = FilterExpression(
+        and_group=FilterExpressionList(expressions=[
+            FilterExpression(
+                or_group=FilterExpressionList(expressions=[
+                    FilterExpression(filter=Filter(
+                        field_name="eventName",
+                        string_filter=Filter.StringFilter(value="scroll"),
+                    )),
+                    FilterExpression(filter=Filter(
+                        field_name="eventName",
+                        string_filter=Filter.StringFilter(value="page_view"),
+                    )),
+                ])
+            ),
+            not_jobs,
+        ])
+    )
+    page_event_rows = _fetch_ga4_report(
+        client, property_id, start_date, end_date,
+        dimensions=["date", "pagePath", "eventName"],
+        metrics=["eventCount"],
+        dimension_filter=page_event_filter,
+        mapper=lambda dims, metrics: {
+            "date": _ga4_date(dims[0]),
+            "page_path": dims[1],
+            "event_name": dims[2],
+            "event_count": int(metrics[0]),
+        },
+    )
+    if page_event_rows:
+        upsert_ga4_page_events(page_event_rows)
+
     return len(all_rows)
 
 
