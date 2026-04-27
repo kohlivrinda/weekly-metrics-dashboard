@@ -147,10 +147,19 @@ def upsert_ga4(rows: list[dict]):
         return
     _batch_execute(
         """
-        INSERT INTO ga4 (date, page_path, session_source, session_medium, sessions)
-        VALUES (%(date)s, %(page_path)s, %(session_source)s, %(session_medium)s, %(sessions)s)
+        INSERT INTO ga4 (date, page_path, session_source, session_medium,
+                         sessions, engaged_sessions, engagement_duration_s, new_users,
+                         exits, conversions)
+        VALUES (%(date)s, %(page_path)s, %(session_source)s, %(session_medium)s,
+                %(sessions)s, %(engaged_sessions)s, %(engagement_duration_s)s, %(new_users)s,
+                %(exits)s, %(conversions)s)
         ON CONFLICT (date, page_path, session_source, session_medium) DO UPDATE SET
-            sessions = EXCLUDED.sessions
+            sessions              = EXCLUDED.sessions,
+            engaged_sessions      = EXCLUDED.engaged_sessions,
+            engagement_duration_s = EXCLUDED.engagement_duration_s,
+            new_users             = EXCLUDED.new_users,
+            exits                 = EXCLUDED.exits,
+            conversions           = EXCLUDED.conversions
         """,
         rows,
     )
@@ -163,14 +172,38 @@ def upsert_ga4_traffic(rows: list[dict]):
     _batch_execute(
         """
         INSERT INTO ga4_traffic
-            (date, session_source, session_medium, sessions, total_users, active_users)
+            (date, session_source, session_medium, sessions, total_users, active_users,
+             engaged_sessions, new_users, engagement_duration_s)
         VALUES
             (%(date)s, %(session_source)s, %(session_medium)s,
-             %(sessions)s, %(total_users)s, %(active_users)s)
+             %(sessions)s, %(total_users)s, %(active_users)s,
+             %(engaged_sessions)s, %(new_users)s, %(engagement_duration_s)s)
         ON CONFLICT (date, session_source, session_medium) DO UPDATE SET
-            sessions = EXCLUDED.sessions,
+            sessions              = EXCLUDED.sessions,
+            total_users           = EXCLUDED.total_users,
+            active_users          = EXCLUDED.active_users,
+            engaged_sessions      = EXCLUDED.engaged_sessions,
+            new_users             = EXCLUDED.new_users,
+            engagement_duration_s = EXCLUDED.engagement_duration_s
+        """,
+        rows,
+    )
+
+
+def upsert_ga4_traffic_weekly(rows: list[dict]):
+    """Upsert weekly first-user-source GA4 user acquisition aggregates."""
+    if not rows:
+        return
+    _batch_execute(
+        """
+        INSERT INTO ga4_traffic_weekly
+            (date, first_user_source, first_user_medium, total_users, new_users)
+        VALUES
+            (%(date)s, %(first_user_source)s, %(first_user_medium)s,
+             %(total_users)s, %(new_users)s)
+        ON CONFLICT (date, first_user_source, first_user_medium) DO UPDATE SET
             total_users = EXCLUDED.total_users,
-            active_users = EXCLUDED.active_users
+            new_users   = EXCLUDED.new_users
         """,
         rows,
     )
@@ -188,6 +221,138 @@ def upsert_ga4_events(rows: list[dict]):
             (%(date)s, %(event_name)s, %(session_primary_channel_group)s, %(event_count)s)
         ON CONFLICT (date, event_name, session_primary_channel_group) DO UPDATE SET
             event_count = EXCLUDED.event_count
+        """,
+        rows,
+    )
+
+
+def upsert_ga4_landing_pages(rows: list[dict]):
+    """Upsert GA4 landing page rows."""
+    if not rows:
+        return
+    _batch_execute(
+        """
+        INSERT INTO ga4_landing_pages
+            (date, landing_page, session_source, session_medium,
+             sessions, engaged_sessions, new_users, engagement_duration_s, conversions)
+        VALUES
+            (%(date)s, %(landing_page)s, %(session_source)s, %(session_medium)s,
+             %(sessions)s, %(engaged_sessions)s, %(new_users)s, %(engagement_duration_s)s,
+             %(conversions)s)
+        ON CONFLICT (date, landing_page, session_source, session_medium) DO UPDATE SET
+            sessions              = EXCLUDED.sessions,
+            engaged_sessions      = EXCLUDED.engaged_sessions,
+            new_users             = EXCLUDED.new_users,
+            engagement_duration_s = EXCLUDED.engagement_duration_s,
+            conversions           = EXCLUDED.conversions
+        """,
+        rows,
+    )
+
+
+def upsert_ga4_category_sessions(rows: list[dict]):
+    """Upsert GA4 category-level session counts (date × category × source × medium)."""
+    if not rows:
+        return
+    _batch_execute(
+        """
+        INSERT INTO ga4_category_sessions
+            (date, page_category, session_source, session_medium, sessions)
+        VALUES (%(date)s, %(page_category)s, %(session_source)s, %(session_medium)s, %(sessions)s)
+        ON CONFLICT (date, page_category, session_source, session_medium) DO UPDATE SET
+            sessions = EXCLUDED.sessions
+        """,
+        rows,
+    )
+
+
+def upsert_ga4_page_events(rows: list[dict]):
+    """Upsert GA4 page-level event counts (scroll depth, etc.)."""
+    if not rows:
+        return
+    _batch_execute(
+        """
+        INSERT INTO ga4_page_events (date, page_path, event_name, event_count)
+        VALUES (%(date)s, %(page_path)s, %(event_name)s, %(event_count)s)
+        ON CONFLICT (date, page_path, event_name) DO UPDATE SET
+            event_count = EXCLUDED.event_count
+        """,
+        rows,
+    )
+
+
+def upsert_ga4_page_before_conversion(rows: list[dict]):
+    """Upsert previous-page-path counts for conversion events."""
+    if not rows:
+        return
+    _batch_execute(
+        """
+        INSERT INTO ga4_page_before_conversion (date, previous_page_path, event_name, event_count)
+        VALUES (%(date)s, %(previous_page_path)s, %(event_name)s, %(event_count)s)
+        ON CONFLICT (date, previous_page_path, event_name) DO UPDATE SET
+            event_count = EXCLUDED.event_count
+        """,
+        rows,
+    )
+
+
+def upsert_gsc_coverage_daily(rows: list[dict]):
+    """Upsert daily indexed/not-indexed counts from GSC Coverage Chart.csv."""
+    if not rows:
+        return
+    _batch_execute(
+        """
+        INSERT INTO gsc_coverage_daily (date, indexed, not_indexed, impressions)
+        VALUES (%(date)s, %(indexed)s, %(not_indexed)s, %(impressions)s)
+        ON CONFLICT (date) DO UPDATE SET
+            indexed     = EXCLUDED.indexed,
+            not_indexed = EXCLUDED.not_indexed,
+            impressions = EXCLUDED.impressions
+        """,
+        rows,
+    )
+
+
+def upsert_gsc_coverage_reasons(rows: list[dict]):
+    """Upsert not-indexed reason snapshot from GSC Coverage issues CSVs."""
+    if not rows:
+        return
+    _batch_execute(
+        """
+        INSERT INTO gsc_coverage_reasons (as_of_date, reason, source, validation, pages)
+        VALUES (%(as_of_date)s, %(reason)s, %(source)s, %(validation)s, %(pages)s)
+        ON CONFLICT (as_of_date, reason) DO UPDATE SET
+            source     = EXCLUDED.source,
+            validation = EXCLUDED.validation,
+            pages      = EXCLUDED.pages
+        """,
+        rows,
+    )
+
+
+def upsert_gsc_coverage_urls(rows: list[dict]):
+    """Upsert individual URLs from a GSC Coverage Drilldown Table.csv."""
+    if not rows:
+        return
+    _batch_execute(
+        """
+        INSERT INTO gsc_coverage_urls (as_of_date, reason, url, last_crawled)
+        VALUES (%(as_of_date)s, %(reason)s, %(url)s, %(last_crawled)s)
+        ON CONFLICT (as_of_date, reason, md5(url)) DO NOTHING
+        """,
+        rows,
+    )
+
+
+def upsert_gsc_non_indexed(rows: list[dict]):
+    """Upsert non-indexed page snapshots (week_start × page_url)."""
+    if not rows:
+        return
+    _batch_execute(
+        """
+        INSERT INTO gsc_non_indexed (week_start, page_url)
+        VALUES (%(week_start)s, %(page_url)s)
+        ON CONFLICT (week_start, md5(page_url)) DO NOTHING
         """,
         rows,
     )

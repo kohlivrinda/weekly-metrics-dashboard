@@ -15,19 +15,64 @@ from google.analytics.data_v1beta.types import (
     RunReportRequest,
 )
 
-def _not_jobs_filter() -> FilterExpression:
-    """Exclude pages whose path contains /jobs (careers traffic, not marketing)."""
+
+# Per-category GA4 filter specs: list of (field, match_type, value).
+# Multiple conditions within a category are OR-combined.
+# match_type: "EXACT" | "BEGINS_WITH" | "CONTAINS"
+CATEGORY_FILTERS: dict[str, list[tuple[str, str, str]]] = {
+    "Articles":           [("pagePath", "BEGINS_WITH", "/articles")],
+    "Blog":               [("pagePath", "BEGINS_WITH", "/blog")],
+    "Maxim Docs":         [("pagePath", "BEGINS_WITH", "/docs")],
+    "Features":           [("pagePath", "BEGINS_WITH", "/features")],
+    "Pricing":            [("pagePath", "BEGINS_WITH", "/pricing"),
+                           ("pagePath", "EXACT",       "/bifrost/pricing")],
+    "LLM Cost Calculator":[("pagePath", "BEGINS_WITH", "/bifrost/llm-cost-calculator"),
+                           ("pagePath", "BEGINS_WITH", "/llm-cost-calculator")],
+    "Comparison Pages":   [("pagePath", "BEGINS_WITH", "/compare")],
+    "Products":           [("pagePath", "BEGINS_WITH", "/products")],
+    "Resources":          [("pagePath", "BEGINS_WITH", "/resources")],
+    "Alternatives":       [("pagePath", "BEGINS_WITH", "/alternatives")],
+    "Industry Pages":     [("pagePath", "BEGINS_WITH", "/industry")],
+    "Provider Status":    [("pagePath", "BEGINS_WITH", "/provider-status")],
+    "Model Library":      [("pagePath", "BEGINS_WITH", "/model-library")],
+    "Bifrost Docs":       [("hostName", "EXACT",       "docs.getbifrost.ai")],
+    "Maxim Homepage":     [("pagePath", "EXACT",       "/")],
+    "Bifrost Enterprise": [("pagePath", "EXACT",       "/enterprise")],
+    "Bifrost":            [("pagePath", "EXACT",       "/bifrost"),
+                           ("pagePath", "EXACT",       "/bifrost/enterprise"),
+                           ("pagePath", "EXACT",       "/bifrost/book-a-demo")],
+}
+
+
+def _build_category_filter(conditions: list[tuple[str, str, str]]) -> FilterExpression:
+    """Build an OR-combined FilterExpression from a list of (field, match_type, value)."""
+    _mt = {
+        "EXACT":       Filter.StringFilter.MatchType.EXACT,
+        "BEGINS_WITH": Filter.StringFilter.MatchType.BEGINS_WITH,
+        "CONTAINS":    Filter.StringFilter.MatchType.CONTAINS,
+    }
+    exprs = [
+        FilterExpression(filter=Filter(
+            field_name=field,
+            string_filter=Filter.StringFilter(match_type=_mt[mt], value=value),
+        ))
+        for field, mt, value in conditions
+    ]
+    return exprs[0] if len(exprs) == 1 else FilterExpression(
+        or_group=FilterExpressionList(expressions=exprs)
+    )
+
+
+def _not_jobs_filter(field: str = "pagePath") -> FilterExpression:
+    """Exclude /jobs pages from GA4 fetches."""
     return FilterExpression(
-        not_expression=FilterExpression(
-            filter=Filter(
-                field_name="pagePath",
-                string_filter=Filter.StringFilter(
-                    match_type=Filter.StringFilter.MatchType.CONTAINS,
-                    value="/jobs",
-                    case_sensitive=False,
-                ),
-            )
-        )
+        not_expression=FilterExpression(filter=Filter(
+            field_name=field,
+            string_filter=Filter.StringFilter(
+                match_type=Filter.StringFilter.MatchType.BEGINS_WITH,
+                value="/jobs",
+            ),
+        ))
     )
 
 
@@ -64,11 +109,11 @@ def _get_credentials(scopes: list[str]) -> service_account.Credentials:
     )
 
 
-def _date_range(num_weeks: int = 4) -> tuple[str, str]:
+def button_date_range(num_weeks: int = 4) -> tuple[str, str]:
     """Return (start_date, end_date) aligned to Sun-Sat week boundaries.
 
     The analysis week runs Sun → Sat. GSC data has a ~2-day lag, so the
-    window ends at the last fully available Saturday. Fetches *num_weeks*
+    window ends at the last fully available Saturday. Covers *num_weeks*
     complete Sun–Sat weeks.
     """
     ref = date.today() - timedelta(days=2)
@@ -82,23 +127,20 @@ def _date_range(num_weeks: int = 4) -> tuple[str, str]:
 def latest_complete_week() -> tuple[date, date]:
     """Return (sunday, saturday) of the most recent complete Sun–Sat week
     with GSC data available (respects the ~2-day lag)."""
-    start_str, end_str = _date_range(num_weeks=1)
+    start_str, end_str = button_date_range(num_weeks=1)
     return date.fromisoformat(start_str), date.fromisoformat(end_str)
 
 
-def fetch_gsc_data() -> tuple[int, bool]:
-    """Fetch GSC Search Analytics data and write to database.
+def fetch_gsc_data(start_date: str, end_date: str) -> int:
+    """Fetch GSC Search Analytics data for the given range and upsert to DB.
 
-    Returns (row_count, already_existed).
+    Returns row count for the main (date × page × query) table.
     """
     site_url = get_gsc_property()
     if not site_url:
         raise RuntimeError("GSC_PROPERTY not set in .env")
 
-    start_date, end_date = _date_range()
-
     from db import (
-        latest_data_date,
         upsert_gsc,
         upsert_gsc_country,
         upsert_gsc_page_daily,
@@ -109,74 +151,57 @@ def fetch_gsc_data() -> tuple[int, bool]:
     credentials = _get_credentials(GSC_SCOPES)
     service = build("searchconsole", "v1", credentials=credentials)
 
-    end_date_obj = date.fromisoformat(end_date)
-    gsc_latest = latest_data_date("gsc")
-    gsc_existed = gsc_latest is not None and gsc_latest >= end_date_obj
-    country_latest = latest_data_date("gsc_country")
-    country_existed = country_latest is not None and country_latest >= end_date_obj
-    page_daily_latest = latest_data_date("gsc_page_daily")
-    page_daily_existed = page_daily_latest is not None and page_daily_latest >= end_date_obj
-    site_daily_latest = latest_data_date("gsc_site_daily")
-    site_daily_existed = site_daily_latest is not None and site_daily_latest >= end_date_obj
-
     # --- Site-level daily totals (date only, no page/query dim — matches GSC UI exactly) ---
-    if not site_daily_existed:
-        site_daily_rows = _fetch_gsc_dimensioned(
-            service, site_url, start_date, end_date,
-            dimensions=["date"],
-            mapper=lambda keys, row: {
-                "date": keys[0],
-                "clicks": row["clicks"],
-                "impressions": row["impressions"],
-                "ctr": row["ctr"],
-                "position": row["position"],
-            },
-        )
-        if site_daily_rows:
-            upsert_gsc_site_daily(site_daily_rows)
+    site_daily_rows = _fetch_gsc_dimensioned(
+        service, site_url, start_date, end_date,
+        dimensions=["date"],
+        mapper=lambda keys, row: {
+            "date": keys[0],
+            "clicks": row["clicks"],
+            "impressions": row["impressions"],
+            "ctr": row["ctr"],
+            "position": row["position"],
+        },
+    )
+    if site_daily_rows:
+        upsert_gsc_site_daily(site_daily_rows)
 
     # --- Country fetch (date × country aggregates) ---
-    if not country_existed:
-        country_rows = _fetch_gsc_dimensioned(
-            service, site_url, start_date, end_date,
-            dimensions=["date", "country"],
-            mapper=lambda keys, row: {
-                "date": keys[0],
-                "country": keys[1],
-                "clicks": row["clicks"],
-                "impressions": row["impressions"],
-                "ctr": row["ctr"],
-                "position": row["position"],
-            },
-        )
-        if country_rows:
-            upsert_gsc_country(country_rows)
+    country_rows = _fetch_gsc_dimensioned(
+        service, site_url, start_date, end_date,
+        dimensions=["date", "country"],
+        mapper=lambda keys, row: {
+            "date": keys[0],
+            "country": keys[1],
+            "clicks": row["clicks"],
+            "impressions": row["impressions"],
+            "ctr": row["ctr"],
+            "position": row["position"],
+        },
+    )
+    if country_rows:
+        upsert_gsc_country(country_rows)
 
     # --- Page-level daily aggregates (no query dimension → accurate totals).
     #     GSC drops anonymized-query rows when `query` is a dimension, so the
     #     (date, page, query) sum under-counts vs the GSC UI. This separate
     #     fetch without the query dimension restores the true totals. ---
-    if not page_daily_existed:
-        page_daily_rows = _fetch_gsc_dimensioned(
-            service, site_url, start_date, end_date,
-            dimensions=["date", "page"],
-            mapper=lambda keys, row: {
-                "date": keys[0],
-                "page": keys[1],
-                "clicks": row["clicks"],
-                "impressions": row["impressions"],
-                "ctr": row["ctr"],
-                "position": row["position"],
-            },
-        )
-        if page_daily_rows:
-            upsert_gsc_page_daily(page_daily_rows)
+    page_daily_rows = _fetch_gsc_dimensioned(
+        service, site_url, start_date, end_date,
+        dimensions=["date", "page"],
+        mapper=lambda keys, row: {
+            "date": keys[0],
+            "page": keys[1],
+            "clicks": row["clicks"],
+            "impressions": row["impressions"],
+            "ctr": row["ctr"],
+            "position": row["position"],
+        },
+    )
+    if page_daily_rows:
+        upsert_gsc_page_daily(page_daily_rows)
 
     # --- Main fetch (date × page × query) ---
-    if gsc_existed:
-        sync_gsc_keyword_rankings()
-        return 0, True
-
     all_rows = _fetch_gsc_dimensioned(
         service, site_url, start_date, end_date,
         dimensions=["date", "page", "query"],
@@ -199,7 +224,84 @@ def fetch_gsc_data() -> tuple[int, bool]:
 
     upsert_gsc(all_rows)
     sync_gsc_keyword_rankings()
-    return len(all_rows), False
+    _fetch_non_indexed_pages(start_date, end_date)
+    return len(all_rows)
+
+
+SITEMAP_URL = "https://www.getmaxim.ai/sitemap.xml"
+
+
+def _parse_sitemap(url: str) -> list[str]:
+    """Recursively fetch and parse a sitemap or sitemap index; return all page URLs."""
+    import urllib.request
+    import xml.etree.ElementTree as ET
+
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "Mozilla/5.0 (compatible; metrics-dashboard/1.0)"},
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        root = ET.fromstring(resp.read())
+
+    ns = (root.tag.split("}")[0] + "}") if "}" in root.tag else ""
+    tag = root.tag.split("}")[-1] if "}" in root.tag else root.tag
+    urls = []
+    if tag == "sitemapindex":
+        for sm in root.findall(f"{ns}sitemap"):
+            loc = sm.find(f"{ns}loc")
+            if loc is not None and loc.text:
+                urls.extend(_parse_sitemap(loc.text.strip()))
+    else:
+        for url_el in root.findall(f"{ns}url"):
+            loc = url_el.find(f"{ns}loc")
+            if loc is not None and loc.text:
+                urls.append(loc.text.strip().rstrip("/").lower())
+    return urls
+
+
+def _fetch_non_indexed_pages(start_date: str, end_date: str):
+    """Diff sitemap URLs against GSC-seen pages per week; upsert to gsc_non_indexed.
+
+    Called at the end of fetch_gsc_data (after gsc_page_daily is populated).
+    Runs per-week within the range so the table stores a weekly trend.
+    Silently skips if the sitemap is unreachable.
+    """
+    from datetime import date as _date, timedelta
+    from db import get_pool, query_df, upsert_gsc_non_indexed
+
+    try:
+        sitemap_urls = set(_parse_sitemap(SITEMAP_URL))
+    except Exception:
+        return
+
+    start = _date.fromisoformat(start_date)
+    end = _date.fromisoformat(end_date)
+
+    # Delete stale rows for this range before re-computing
+    pool = get_pool()
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM gsc_non_indexed WHERE week_start >= %s AND week_start <= %s",
+                (start_date, end_date),
+            )
+        conn.commit()
+
+    all_rows = []
+    wk = start
+    while wk <= end:
+        wk_end = min(wk + timedelta(days=6), end)
+        gsc_df = query_df(
+            "SELECT DISTINCT LOWER(RTRIM(page, '/')) AS page "
+            "FROM gsc_page_daily WHERE date >= %s AND date <= %s",
+            (wk.isoformat(), wk_end.isoformat()),
+        )
+        gsc_pages = set(gsc_df["page"].tolist()) if not gsc_df.empty else set()
+        for url in sitemap_urls - gsc_pages:
+            all_rows.append({"week_start": wk.isoformat(), "page_url": url})
+        wk += timedelta(days=7)
+
+    upsert_gsc_non_indexed(all_rows)
 
 
 def _fetch_gsc_dimensioned(service, site_url, start_date, end_date, dimensions, mapper):
@@ -232,97 +334,99 @@ def _fetch_gsc_dimensioned(service, site_url, start_date, end_date, dimensions, 
     return out
 
 
-def fetch_ga4_data() -> tuple[int, bool]:
-    """Fetch GA4 report data and write to database.
+def fetch_ga4_data(start_date: str, end_date: str) -> int:
+    """Fetch GA4 report data for the given range and upsert to DB.
 
-    Returns (row_count, already_existed).
+    Returns row count for the main (date × page × source × medium) table.
     """
     property_id = get_ga4_property_id()
     if not property_id:
         raise RuntimeError("GA4_PROPERTY_ID not set in .env")
 
-    start_date, end_date = _date_range()
-
     from db import (
-        latest_data_date,
         upsert_ga4,
         upsert_ga4_traffic,
         upsert_ga4_events,
+        upsert_ga4_landing_pages,
     )
 
-    end_date_obj = date.fromisoformat(end_date)
     credentials = _get_credentials(GA4_SCOPES)
     client = BetaAnalyticsDataClient(credentials=credentials)
 
-    not_jobs = _not_jobs_filter()
+    # --- Source+medium-level traffic (daily) — accurate sessions, inflated user counts ---
+    traffic_rows = _fetch_ga4_report(
+        client, property_id, start_date, end_date,
+        dimensions=["date", "sessionSource", "sessionMedium"],
+        metrics=["sessions", "totalUsers", "activeUsers",
+                 "engagedSessions", "newUsers", "userEngagementDuration"],
+        dimension_filter=_not_jobs_filter("pagePath"),
+        mapper=lambda dims, metrics: {
+            "date": _ga4_date(dims[0]),
+            "session_source": dims[1],
+            "session_medium": dims[2],
+            "sessions": int(metrics[0]),
+            "total_users": int(metrics[1]),
+            "active_users": int(metrics[2]),
+            "engaged_sessions": int(metrics[3]),
+            "new_users": int(metrics[4]),
+            "engagement_duration_s": int(float(metrics[5])),
+        },
+    )
+    if traffic_rows:
+        from db import upsert_ga4_traffic
+        upsert_ga4_traffic(traffic_rows)
 
-    # --- Source+medium-level traffic with user counts ---
-    traffic_latest = latest_data_date("ga4_traffic")
-    if traffic_latest is None or traffic_latest < end_date_obj:
-        traffic_rows = _fetch_ga4_report(
-            client, property_id, start_date, end_date,
-            dimensions=["date", "sessionSource", "sessionMedium"],
-            metrics=["sessions", "totalUsers", "activeUsers"],
-            mapper=lambda dims, metrics: {
-                "date": _ga4_date(dims[0]),
-                "session_source": dims[1],
-                "session_medium": dims[2],
-                "sessions": int(metrics[0]),
-                "total_users": int(metrics[1]),
-                "active_users": int(metrics[2]),
-            },
-        )
-        if traffic_rows:
-            upsert_ga4_traffic(traffic_rows)
+    # --- Weekly traffic aggregates (no date dim) — accurate user counts for periods ---
+    _fetch_ga4_traffic_weekly(client, property_id, start_date, end_date)
 
     # --- Tracked events by channel group ---
-    events_latest = latest_data_date("ga4_events")
-    if events_latest is None or events_latest < end_date_obj:
-        event_filter = FilterExpression(
-            and_group=FilterExpressionList(expressions=[
-                FilterExpression(
-                    or_group=FilterExpressionList(expressions=[
-                        FilterExpression(filter=Filter(
-                            field_name="eventName",
-                            string_filter=Filter.StringFilter(value=name),
-                        ))
-                        for name in TRACKED_EVENT_NAMES
-                    ])
-                ),
-                not_jobs,
-            ])
-        )
-        event_rows = _fetch_ga4_report(
-            client, property_id, start_date, end_date,
-            dimensions=["date", "eventName", "sessionPrimaryChannelGroup"],
-            metrics=["eventCount"],
-            dimension_filter=event_filter,
-            mapper=lambda dims, metrics: {
-                "date": _ga4_date(dims[0]),
-                "event_name": dims[1],
-                "session_primary_channel_group": dims[2],
-                "event_count": int(metrics[0]),
-            },
-        )
-        if event_rows:
-            upsert_ga4_events(event_rows)
+    event_filter = FilterExpression(
+        and_group=FilterExpressionList(expressions=[
+            FilterExpression(
+                or_group=FilterExpressionList(expressions=[
+                    FilterExpression(filter=Filter(
+                        field_name="eventName",
+                        string_filter=Filter.StringFilter(value=name),
+                    ))
+                    for name in TRACKED_EVENT_NAMES
+                ])
+            ),
+            _not_jobs_filter("pagePath"),
+        ])
+    )
+    event_rows = _fetch_ga4_report(
+        client, property_id, start_date, end_date,
+        dimensions=["date", "eventName", "sessionPrimaryChannelGroup"],
+        metrics=["eventCount"],
+        dimension_filter=event_filter,
+        mapper=lambda dims, metrics: {
+            "date": _ga4_date(dims[0]),
+            "event_name": dims[1],
+            "session_primary_channel_group": dims[2],
+            "event_count": int(metrics[0]),
+        },
+    )
+    if event_rows:
+        upsert_ga4_events(event_rows)
 
-    # --- Main page-level sessions fetch (existing ga4 table) ---
-    ga4_latest = latest_data_date("ga4")
-    if ga4_latest is not None and ga4_latest >= end_date_obj:
-        return 0, True
-
+    # --- Main page-level sessions fetch with engagement metrics ---
     all_rows = _fetch_ga4_report(
         client, property_id, start_date, end_date,
         dimensions=["date", "pagePath", "sessionSource", "sessionMedium"],
-        metrics=["sessions"],
-        dimension_filter=not_jobs,
+        metrics=["sessions", "engagedSessions", "userEngagementDuration", "newUsers",
+                 "conversions"],
+        dimension_filter=_not_jobs_filter("pagePath"),
         mapper=lambda dims, metrics: {
             "date": _ga4_date(dims[0]),
             "page_path": dims[1],
             "session_source": dims[2],
             "session_medium": dims[3],
             "sessions": int(metrics[0]),
+            "engaged_sessions": int(metrics[1]),
+            "engagement_duration_s": int(float(metrics[2])),
+            "new_users": int(metrics[3]),
+            "exits": 0,
+            "conversions": int(float(metrics[4])),
         },
     )
 
@@ -333,7 +437,155 @@ def fetch_ga4_data() -> tuple[int, bool]:
         )
 
     upsert_ga4(all_rows)
-    return len(all_rows), False
+
+    # --- Landing page entry-point sessions ---
+    landing_rows = _fetch_ga4_report(
+        client, property_id, start_date, end_date,
+        dimensions=["date", "landingPage", "sessionSource", "sessionMedium"],
+        metrics=["sessions", "engagedSessions", "newUsers", "userEngagementDuration",
+                 "conversions"],
+        dimension_filter=_not_jobs_filter("landingPage"),
+        mapper=lambda dims, metrics: {
+            "date": _ga4_date(dims[0]),
+            "landing_page": dims[1],
+            "session_source": dims[2],
+            "session_medium": dims[3],
+            "sessions": int(metrics[0]),
+            "engaged_sessions": int(metrics[1]),
+            "new_users": int(metrics[2]),
+            "engagement_duration_s": int(float(metrics[3])),
+            "conversions": int(float(metrics[4])),
+        },
+    )
+    if landing_rows:
+        upsert_ga4_landing_pages(landing_rows)
+
+
+    # --- Per-category session counts (one filtered query per category) ---
+    fetch_ga4_category_sessions(start_date, end_date, client=client, property_id=property_id)
+
+    return len(all_rows)
+
+
+def _fetch_ga4_traffic_weekly(client, property_id: str, start_date: str, end_date: str):
+    """Fetch weekly user acquisition aggregates using firstUserSource dimension.
+
+    Uses firstUserSource/firstUserMedium (User Acquisition report) without the
+    date dimension so GA4 deduplicates users across the week server-side.
+    Sessions stay in ga4_traffic (Traffic Acquisition / sessionSource).
+    Week-start date stored as the row's date.
+    """
+    from datetime import date as _date, timedelta
+    from db import upsert_ga4_traffic_weekly, get_pool
+    from config import week_start as _week_start
+
+    end = _date.fromisoformat(end_date)
+    # Snap to the Sunday that opens the first affected week so stored dates are
+    # always Sundays regardless of what day the cron runs.
+    start = _week_start(_date.fromisoformat(start_date))
+    weeks: list[tuple[_date, _date]] = []
+    wk = start
+    while wk <= end:
+        weeks.append((wk, min(wk + timedelta(days=6), end)))
+        wk += timedelta(days=7)
+
+    all_rows = []
+    for week_start, week_end in weeks:
+        rows = _fetch_ga4_report(
+            client, property_id,
+            week_start.isoformat(), week_end.isoformat(),
+            dimensions=["firstUserSource", "firstUserMedium"],
+            metrics=["totalUsers", "newUsers"],
+            dimension_filter=_not_jobs_filter("pagePath"),
+            mapper=lambda dims, metrics, d=week_start: {
+                "date": d.isoformat(),
+                "first_user_source": dims[0],
+                "first_user_medium": dims[1],
+                "total_users": int(metrics[0]),
+                "new_users": int(metrics[1]),
+            },
+        )
+        all_rows.extend(rows)
+
+    if all_rows:
+        pool = get_pool()
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM ga4_traffic_weekly WHERE date >= %s AND date <= %s",
+                    (start.isoformat(), end_date),
+                )
+            conn.commit()
+        upsert_ga4_traffic_weekly(all_rows)
+
+
+def fetch_ga4_category_sessions(
+    start_date: str,
+    end_date: str,
+    client=None,
+    property_id: str | None = None,
+) -> int:
+    """Fetch GA4 sessions per page category using per-category page filters.
+
+    Fetches each 7-day week separately without the date dimension to avoid
+    GA4 privacy thresholds that silently drop small (date, source, medium)
+    buckets. The week-start date is stored as the row's date.
+    'Other' is derived at display time as total_sessions − sum(categories).
+    """
+    from datetime import date as _date, timedelta
+    from db import upsert_ga4_category_sessions
+    from config import week_start as _week_start
+
+    if client is None:
+        credentials = _get_credentials(GA4_SCOPES)
+        client = BetaAnalyticsDataClient(credentials=credentials)
+    if property_id is None:
+        property_id = get_ga4_property_id()
+    if not property_id:
+        raise RuntimeError("GA4_PROPERTY_ID not set in .env")
+
+    # Snap to the Sunday opening the first affected week so stored dates are
+    # always Sundays regardless of what day the cron runs.
+    end = _date.fromisoformat(end_date)
+    start = _week_start(_date.fromisoformat(start_date))
+    weeks: list[tuple[_date, _date]] = []
+    wk = start
+    while wk <= end:
+        weeks.append((wk, min(wk + timedelta(days=6), end)))
+        wk += timedelta(days=7)
+
+    all_rows = []
+    for week_start, week_end in weeks:
+        for category, conditions in CATEGORY_FILTERS.items():
+            dim_filter = _build_category_filter(conditions)
+            rows = _fetch_ga4_report(
+                client, property_id,
+                week_start.isoformat(), week_end.isoformat(),
+                dimensions=["sessionSource", "sessionMedium"],
+                metrics=["sessions"],
+                dimension_filter=dim_filter,
+                mapper=lambda dims, metrics, cat=category, d=week_start: {
+                    "date": d.isoformat(),
+                    "page_category": cat,
+                    "session_source": dims[0],
+                    "session_medium": dims[1],
+                    "sessions": int(metrics[0]),
+                },
+            )
+            all_rows.extend(rows)
+
+    if all_rows:
+        from db import get_pool
+        pool = get_pool()
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM ga4_category_sessions WHERE date >= %s AND date <= %s",
+                    (start.isoformat(), end_date),
+                )
+            conn.commit()
+        upsert_ga4_category_sessions(all_rows)
+    return len(all_rows)
 
 
 def _ga4_date(raw: str) -> str:

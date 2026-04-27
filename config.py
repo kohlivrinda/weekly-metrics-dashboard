@@ -2,6 +2,7 @@
 
 import json
 import os
+from datetime import date as _date, timedelta as _timedelta
 
 from dotenv import load_dotenv
 
@@ -13,21 +14,44 @@ PAGE_CATEGORIES = {
     "/articles": "Articles",
     "/blog": "Blog",
     "/compare": "Comparison Pages",
-    "/docs": "Docs",
+    "/docs": "Maxim Docs",
     "/products": "Products",
-    "/bifrost": "Bifrost",
+    "/bifrost/llm-cost-calculator": "LLM Cost Calculator",
     "/llm-cost-calculator": "LLM Cost Calculator",
     "/provider-status": "Provider Status",
     "/model-library": "Model Library",
     "/resources": "Resources",
     "/alternatives": "Alternatives",
     "/industry": "Industry Pages",
+    "/pricing": "Pricing",
+    "/features": "Features",
+    # Bifrost documentation (docs.bifrost.ai paths tracked under same GA4 property)
+    "/overview": "Bifrost Docs",
+    "/quickstart": "Bifrost Docs",
+    "/mcp": "Bifrost Docs",
+    "/providers": "Bifrost Docs",
+    "/deployment-guides": "Bifrost Docs",
+    "/api-reference": "Bifrost Docs",
+    "/integrations": "Bifrost Docs",
+    "/architecture": "Bifrost Docs",
+    "/plugins": "Bifrost Docs",
+    "/models-catalog": "Bifrost Docs",
+    "/evals-handbook": "Bifrost Docs",
+    "/contributing": "Bifrost Docs",
+    "/benchmarking": "Bifrost Docs",
+    "/migration-guides": "Bifrost Docs",
+    "/cli-agents": "Bifrost Docs",
+    "/changelogs": "Bifrost Docs",
 }
 
-# These are matched separately since they don't follow the path-prefix pattern.
+# Exact-match pages (checked before prefix matching).
 SPECIAL_PAGES = {
-    "/": "Bifrost Homepage",
+    "/": "Maxim Homepage",
     "/enterprise": "Bifrost Enterprise",
+    "/bifrost": "Bifrost",
+    "/bifrost/enterprise": "Bifrost",
+    "/bifrost/book-a-demo": "Bifrost",
+    "/bifrost/pricing": "Pricing",
 }
 
 
@@ -36,15 +60,30 @@ def categorize_page(page_path: str) -> str:
     if not isinstance(page_path, str) or not page_path:
         return "Other"
 
+    # Strip query string — GA4's landingPage dimension includes query params
+    page_path = page_path.split("?")[0]
+
     # Check special pages first (exact match)
     for pattern, name in SPECIAL_PAGES.items():
         if page_path.rstrip("/") == pattern.rstrip("/"):
             return name
 
-    # Check path prefixes
+    # Check explicit prefix matches
     for prefix, name in PAGE_CATEGORIES.items():
         if page_path.startswith(prefix):
             return name
+
+    # Auto-group /bifrost/<segment>/... by the segment name.
+    # e.g. /bifrost/resources/mcp-gateway → "Bifrost Resources"
+    #      /bifrost/provider-status/azure → "Bifrost Provider Status"
+    parts = [p for p in page_path.split("/") if p]
+    if len(parts) >= 2 and parts[0] == "bifrost":
+        segment = parts[1].replace("-", " ").title()
+        return f"Bifrost {segment}"
+
+    # /enterprise/<slug> paths are docs.getbifrost.ai enterprise docs pages
+    if len(parts) >= 2 and parts[0] == "enterprise":
+        return "Bifrost Docs"
 
     return "Other"
 
@@ -52,7 +91,7 @@ def categorize_page(page_path: str) -> str:
 # Top-level prefixes where the 2nd path segment is a meaningful subcategory.
 # e.g. /bifrost/resources/xyz → "Bifrost > resources", but /articles/<slug>
 # stays just "Articles" (slug is unique per page, drill-down is noise).
-DEEP_CATEGORY_PREFIXES = {"/bifrost", "/compare"}
+DEEP_CATEGORY_PREFIXES = {"/compare"}
 
 
 def categorize_page_deep(page_path: str) -> str:
@@ -136,6 +175,11 @@ TOPIC_COMPETITORS = {
     "Bifrost": ["litellm", "portkey"],
     "Maxim": ["langfuse", "langsmith", "braintrust", "arize", "helicone"],
 }
+
+def week_start(d: _date) -> _date:
+    """Return the Sunday that begins the Sun–Sat week containing d."""
+    return d - _timedelta(days=d.isoweekday() % 7)
+
 
 def get_database_url() -> str | None:
     """Return DATABASE_URL from environment, or None if not set."""
